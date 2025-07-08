@@ -7,7 +7,6 @@ from utils import static_utils
 import logging
 import os
 import scipy
-import time
 
 
 class BasicTrainer:
@@ -47,7 +46,7 @@ class BasicTrainer:
         self.train(dataset_handler, verbose)
         top_words = self.export_top_words(dataset_handler.vocab, num_top_words)
     
-        if self.model_name == 'HiCOT':
+        if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C':
             train_theta = self.test(dataset_handler.train_data, dataset_handler.doc_embeddings)
         else:
             print(f"Wrong model")
@@ -64,17 +63,12 @@ class BasicTrainer:
 
         data_size = len(dataset_handler.train_dataloader.dataset)
 
-        total_start_time = time.time()
-        epoch_times = []
-
         for epoch_id, epoch in enumerate(tqdm(range(1, self.epochs + 1))):
-            epoch_start_time = time.time()
-
             self.model.train()
             loss_rst_dict = defaultdict(float)
 
             for batch_id, batch in enumerate(dataset_handler.train_dataloader): 
-                if self.model_name == 'HiCOT':
+                if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C':
                     *inputs, indices, doc_embeddings = batch
                 else:
                     print(f"Wrong model")
@@ -96,9 +90,6 @@ class BasicTrainer:
 
             if self.lr_scheduler:
                 lr_scheduler.step()
-            
-            epoch_duration = time.time() - epoch_start_time
-            epoch_times.append(epoch_duration)
 
             if verbose and epoch % self.log_interval == 0:
                 output_log = f'Epoch: {epoch:03d}'
@@ -106,9 +97,6 @@ class BasicTrainer:
                     output_log += f' {key}: {loss_rst_dict[key] / data_size :.3f}'
 
                 self.logger.info(output_log)
-        
-        total_duration = time.time() - total_start_time
-        print(f"Average epoch time: {total_duration/len(epoch_times):.5f} seconds")
 
     def test(self, input_data, train_data=None):
         data_size = input_data.shape[0]

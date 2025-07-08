@@ -3,6 +3,7 @@ import os
 import numpy as np
 import basic_trainer
 from HiCOT.HiCOT import HiCOT
+from HiCOT.HiCOT_C import HiCOT_C
 import evaluations
 import datasethandler
 import scipy
@@ -37,6 +38,9 @@ if __name__ == "__main__":
     config.add_model_argument(parser)
     config.add_training_argument(parser)
     config.add_eval_argument(parser)
+    # Thêm dòng này để nhận weight_loss_coherence từ command line
+    parser.add_argument('--weight_loss_coherence', type=float, default=1.0)
+    parser.add_argument('--cooc_norm', type=str, default='log')
     args = parser.parse_args()
 
     current_time = miscellaneous.get_current_datetime()
@@ -89,7 +93,38 @@ if __name__ == "__main__":
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
 
-    
+    elif args.model == "HiCOT_C":
+        model = HiCOT_C(
+            vocab_size=dataset.vocab_size,
+            data_name=args.dataset,
+            num_topics=args.num_topics,
+            dropout=args.dropout,
+            pretrained_WE=pretrainWE if args.use_pretrainWE else None,
+            weight_loss_ECR=args.weight_ECR,
+            alpha_ECR=args.alpha_ECR,
+            weight_loss_TP=args.weight_loss_TP,
+            weight_loss_DT=args.weight_loss_DT,
+            alpha_TP=args.alpha_TP,
+            alpha_DT=args.alpha_DT,
+            beta_temp=args.beta_temp,
+            vocab=dataset.vocab,
+            weight_loss_CLC=args.weight_loss_CLC,
+            max_clusters=args.max_clusters,
+            weight_loss_CLT=args.weight_loss_CLT,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
+            method_CL=args.method_CL,
+            metric_CL=args.metric_CL,
+            # Thêm các tham số cho loss_coherence
+            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
+            cooc_norm=getattr(args, 'cooc_norm', 'log'),
+            train_data=dataset.train_bow,  # Đảm bảo truyền đúng train_bow
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
     else:
         print(f"Wrong model")
 

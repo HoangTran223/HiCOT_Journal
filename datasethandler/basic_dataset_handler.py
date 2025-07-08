@@ -154,7 +154,7 @@ class BasicDatasetHandler:
                 """train_dataset = DatasetHandler(self.train_data)
                 test_dataset = DatasetHandler(self.test_data)"""
 
-                if args.model == "HiCOT":
+                if args.model == "HiCOT" or args.model == "HiCOT_C":
                     train_dataset = TensorDataset(self.train_data, self.train_indices, 
                                             torch.tensor(self.train_doc_embeddings, dtype=torch.float))
                     test_dataset = TensorDataset(self.test_data, self.test_indices, 
