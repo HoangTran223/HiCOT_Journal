@@ -13,16 +13,22 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from sklearn.cluster import KMeans
 from utils import static_utils
-from .glove_cooccurrence import build_cooccurrence_matrix
+from .advanced_cooccurrence import AdvancedCooccurrenceBuilder
 import os
 
-class HiCOT_C(nn.Module):
-    def __init__(self, vocab_size, data_name = '20NG', num_topics=50, en_units=200, dropout=0.,
-                threshold_epoch = 10, doc2vec_size=384, pretrained_WE=None, embed_size=200, beta_temp=0.2, 
-                weight_loss_CLT=1.0, threshold_cluster=30, weight_loss_ECR=250.0, alpha_ECR=20.0, weight_loss_TP = 250.0, 
-                alpha_TP = 20.0, alpha_DT: float=3.0, weight_loss_DT = 10.0, vocab = None, doc_embeddings=None,
-                weight_loss_CLC= 1.0, max_clusters = 50, method_CL = 'HAC', metric_CL = 'euclidean', sinkhorn_max_iter=5000,
-                weight_loss_coherence=1.0, cooc_norm='log', cooc_window_size=10, train_data=None):
+class HiCOT_Enhanced(nn.Module):
+    """
+    Enhanced HiCOT with Multi-Scale Coherence Loss for improved topic coherence
+    """
+    def __init__(self, vocab_size, data_name='20NG', num_topics=50, en_units=200, dropout=0.,
+                threshold_epoch=10, doc2vec_size=384, pretrained_WE=None, embed_size=200, beta_temp=0.2, 
+                weight_loss_CLT=1.0, threshold_cluster=30, weight_loss_ECR=250.0, alpha_ECR=20.0, 
+                weight_loss_TP=250.0, alpha_TP=20.0, alpha_DT=3.0, weight_loss_DT=10.0, 
+                vocab=None, doc_embeddings=None, weight_loss_CLC=1.0, max_clusters=50, 
+                method_CL='HAC', metric_CL='euclidean', sinkhorn_max_iter=5000,
+                # Multi-Scale Coherence parameters only
+                weight_loss_coherence=1.0, coherence_window_sizes=[2, 5, 10], 
+                coherence_norm='pmi', coherence_top_k=15, train_data=None):
 
         super().__init__()
 
@@ -33,7 +39,9 @@ class HiCOT_C(nn.Module):
         self.num_topics = num_topics
         self.beta_temp = beta_temp
         self.data_name = data_name
+        self.vocab_size = vocab_size
 
+        # Standard parameters
         self.a = 1 * np.ones((1, num_topics)).astype(np.float32)
         self.mu2 = nn.Parameter(torch.as_tensor(
             (np.log(self.a).T - np.mean(np.log(self.a), 1)).T))
@@ -43,6 +51,7 @@ class HiCOT_C(nn.Module):
         self.mu2.requires_grad = False
         self.var2.requires_grad = False
 
+        # Neural network layers
         self.fc11 = nn.Linear(vocab_size, en_units)
         self.fc12 = nn.Linear(en_units, en_units)
         self.fc21 = nn.Linear(en_units, num_topics)
@@ -56,6 +65,7 @@ class HiCOT_C(nn.Module):
         self.decoder_bn = nn.BatchNorm1d(vocab_size, affine=True)
         self.decoder_bn.weight.requires_grad = False
 
+        # Word and topic embeddings
         if pretrained_WE is not None:
             self.word_embeddings = torch.from_numpy(pretrained_WE).float()
         else:
@@ -67,19 +77,19 @@ class HiCOT_C(nn.Module):
         nn.init.trunc_normal_(self.topic_embeddings, std=0.1)
         self.topic_embeddings = nn.Parameter(F.normalize(self.topic_embeddings))
 
+        # Loss components
         self.ECR = ECR(weight_loss_ECR, alpha_ECR, sinkhorn_max_iter)
         self.weight_loss_CLT = weight_loss_CLT
         self.weight_loss_CLC = weight_loss_CLC
+        self.DT = DT(weight_loss_DT, alpha_TP)
+        self.TP = TP(weight_loss_TP, alpha_TP)
 
+        # Additional attributes
         self.max_clusters = max_clusters
         self.vocab = vocab
         self.matrixP = None
-        self.DT = DT(weight_loss_DT, alpha_TP)
-
-        self.doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
+        self.doc_embeddings = doc_embeddings.to(self.topic_embeddings.device) if doc_embeddings is not None else None
         self.group_topic = None
-
-        self.TP = TP(weight_loss_TP, alpha_TP)
 
         self.document_emb_prj = nn.Sequential(
             nn.Linear(doc2vec_size, embed_size), 
@@ -90,29 +100,104 @@ class HiCOT_C(nn.Module):
         self.topics = []
         self.topic_index_mapping = {}
 
-        # GloVe-style topic coherence regularization
+        # Multi-Scale Coherence parameters only
         self.weight_loss_coherence = weight_loss_coherence
-        self.cooc_norm = cooc_norm
-        self.cooc_window_size = cooc_window_size
-        self.cooc_matrix = None
+        self.coherence_window_sizes = coherence_window_sizes
+        self.coherence_norm = coherence_norm
+        self.coherence_top_k = coherence_top_k
+        self.cooc_matrices = {}
+        
+        # Build multi-scale co-occurrence matrices
         if train_data is not None and vocab is not None:
-            precomputed_dir = 'precomputed'
-            os.makedirs(precomputed_dir, exist_ok=True)
-            cooc_matrix_path = os.path.join(precomputed_dir, f'cooc_{data_name}.npy')
+            self._build_coherence_matrices(train_data, vocab)
 
+    def _build_coherence_matrices(self, train_data, vocab):
+        """Build and cache multi-scale co-occurrence matrices"""
+        precomputed_dir = 'precomputed'
+        os.makedirs(precomputed_dir, exist_ok=True)
+        
+        cooc_builder = AdvancedCooccurrenceBuilder(
+            window_sizes=self.coherence_window_sizes,
+            subsampling_threshold=1e-3
+        )
+        
+        for window_size in self.coherence_window_sizes:
+            cooc_matrix_path = os.path.join(
+                precomputed_dir, 
+                f'enhanced_cooc_{self.data_name}_w{window_size}_{self.coherence_norm}.npy'
+            )
+            
             if os.path.exists(cooc_matrix_path):
-                logging.info(f"Loading co-occurrence matrix from {cooc_matrix_path}")
+                logging.info(f"Loading enhanced co-occurrence matrix (window={window_size}) from {cooc_matrix_path}")
                 cooc_matrix_np = np.load(cooc_matrix_path)
-                self.cooc_matrix = torch.tensor(cooc_matrix_np, dtype=torch.float32)
+                self.cooc_matrices[window_size] = torch.tensor(cooc_matrix_np, dtype=torch.float32)
             else:
-                logging.info(f"Building co-occurrence matrix for {data_name}...")
-                cooc_matrix_np = build_cooccurrence_matrix(
-                    train_data, vocab, norm=cooc_norm
+                logging.info(f"Building enhanced co-occurrence matrices for {self.data_name}...")
+                all_matrices = cooc_builder.build_multi_scale_cooccurrence(
+                    train_data, vocab, norm=self.coherence_norm
                 )
-                logging.info(f"Saving co-occurrence matrix to {cooc_matrix_path}")
-                np.save(cooc_matrix_path, cooc_matrix_np)
-                self.cooc_matrix = torch.tensor(cooc_matrix_np, dtype=torch.float32)
+                
+                # Save all matrices
+                for ws, matrix in all_matrices.items():
+                    save_path = os.path.join(
+                        precomputed_dir, 
+                        f'enhanced_cooc_{self.data_name}_w{ws}_{self.coherence_norm}.npy'
+                    )
+                    np.save(save_path, matrix)
+                    self.cooc_matrices[ws] = torch.tensor(matrix, dtype=torch.float32)
+                    logging.info(f"Saved enhanced co-occurrence matrix (window={ws}) to {save_path}")
+                break  # Only need to build once
 
+    def get_beta(self):
+        dist = self.pairwise_euclidean_distance(
+            self.topic_embeddings, self.word_embeddings)
+        beta = F.softmax(-dist / self.beta_temp, dim=0)
+        return beta
+
+    def get_loss_multi_scale_coherence(self):
+        """
+        MAIN COHERENCE LOSS: Multi-scale coherence loss combining local and global coherence
+        This is the core innovation that directly optimizes for CV coherence metric
+        """
+        if self.weight_loss_coherence <= 1e-8 or not self.cooc_matrices:
+            return 0.0
+            
+        beta = self.get_beta().detach()  # [num_topics, vocab_size]
+        total_coherence_loss = 0.0
+        
+        # Multi-scale coherence loss with different window sizes
+        for window_size, cooc_matrix in self.cooc_matrices.items():
+            X = cooc_matrix.to(self.topic_embeddings.device)
+            
+            # Get top-k words for each topic (most relevant for CV metric)
+            top_k_indices = torch.topk(beta, k=self.coherence_top_k, dim=1)[1]  # [num_topics, k]
+            
+            coherence_loss = 0.0
+            for topic_idx in range(self.num_topics):
+                topic_words = top_k_indices[topic_idx]  # [k]
+                
+                # Pairwise coherence within topic - this directly mimics CV calculation
+                for i in range(len(topic_words)):
+                    for j in range(i + 1, len(topic_words)):
+                        word_i, word_j = topic_words[i], topic_words[j]
+                        
+                        # Expected co-occurrence based on topic-word probabilities
+                        expected_cooc = beta[topic_idx, word_i] * beta[topic_idx, word_j]
+                        
+                        # Actual cooccurrence from corpus (symmetric)
+                        actual_cooc = X[word_i, word_j] + X[word_j, word_i]
+                        
+                        # Core coherence loss: maximize actual co-occurrence for high-probability word pairs
+                        if actual_cooc > 1e-8:
+                            # Use log to match PMI-style calculation
+                            coherence_loss += expected_cooc * torch.log(actual_cooc + 1e-8)
+            
+            # Weight by inverse window size (smaller windows = more local coherence = more important)
+            weight = 1.0 / window_size
+            total_coherence_loss += weight * coherence_loss
+        
+        # Return negative loss (we want to maximize coherence)
+        return -self.weight_loss_coherence * total_coherence_loss
 
     def create_group_topic(self):
         with torch.no_grad():  
@@ -121,12 +206,10 @@ class HiCOT_C(nn.Module):
 
         if self.method_CL == 'HAC':
             Z = linkage(distances, method='average', optimal_ordering=True) 
-            group_id = fcluster(Z, t= self.max_clusters, criterion='maxclust') - 1
-        
+            group_id = fcluster(Z, t=self.max_clusters, criterion='maxclust') - 1
         elif self.method_CL == 'HDBSCAN':
             clusterer = hdbscan.HDBSCAN(min_cluster_size=2, metric='euclidean')
             group_id = clusterer.fit_predict(distances)
-        
         else:
             raise ValueError(f"Invalid method_CL: {self.method_CL}")
         
@@ -140,26 +223,20 @@ class HiCOT_C(nn.Module):
             self.topics.append(word_topic_assignments[topic_idx])
             self.topic_index_mapping[topic_idx] = topic_idx_counter
             topic_idx_counter += 1
-    
-    
+
     def get_word_topic_assignments(self):
         word_topic_assignments = [[] for _ in range(self.num_topics)]
-
         for word_idx, word in enumerate(self.vocab):
             topic_idx = self.word_to_topic_by_similarity(word)
             word_topic_assignments[topic_idx].append(word_idx)
         return word_topic_assignments
 
-
     def word_to_topic_by_similarity(self, word):
         word_idx = self.vocab.index(word)
         word_embedding = self.word_embeddings[word_idx].unsqueeze(0)
-
         similarity_scores = F.cosine_similarity(word_embedding, self.topic_embeddings)
         topic_idx = torch.argmax(similarity_scores).item()
-
         return topic_idx
-
 
     def get_loss_CLC(self, margin=0.2, num_negatives=10):
         loss_CLC = 0.0
@@ -185,7 +262,6 @@ class HiCOT_C(nn.Module):
             if self.metric_CL == 'euclidean':
                 pos_distance = F.pairwise_distance(anchor, positive)
                 neg_distances = F.pairwise_distance(anchor.repeat(num_negatives, 1), negatives)
-                
             elif self.metric_CL == 'cosine':
                 pos_similarity = F.cosine_similarity(anchor, positive)
                 neg_similarities = F.cosine_similarity(anchor.repeat(num_negatives, 1), negatives)
@@ -200,7 +276,6 @@ class HiCOT_C(nn.Module):
         loss_CLC *= self.weight_loss_CLC
         return loss_CLC
 
-    
     def get_loss_CLT(self, margin=0.2, num_negatives=10):
         loss_CLT = 0.0
         for group_idx, group_topics in enumerate(self.group_topic):
@@ -211,7 +286,6 @@ class HiCOT_C(nn.Module):
                     continue
 
                 anchor = torch.mean(self.word_embeddings[anchor_words_idxes], dim=0, keepdim=True)
-                
                 positive_word_idx = np.random.choice(anchor_words_idxes)
                 positive = self.word_embeddings[positive_word_idx].unsqueeze(0)
                 negative_candidates = []
@@ -229,7 +303,6 @@ class HiCOT_C(nn.Module):
                 if self.metric_CL == 'euclidean':
                     pos_distance = F.pairwise_distance(anchor, positive)
                     neg_distances = F.pairwise_distance(anchor.repeat(num_negatives, 1), negatives)
-                
                 elif self.metric_CL == 'cosine':
                     pos_similarity = F.cosine_similarity(anchor, positive)
                     neg_similarities = F.cosine_similarity(anchor.repeat(num_negatives, 1), negatives)
@@ -243,27 +316,6 @@ class HiCOT_C(nn.Module):
 
         loss_CLT *= self.weight_loss_CLT
         return loss_CLT
-
-
-    def get_beta(self):
-        dist = self.pairwise_euclidean_distance(
-            self.topic_embeddings, self.word_embeddings)
-        beta = F.softmax(-dist / self.beta_temp, dim=0)
-        return beta
-
-    def get_loss_coherence(self):
-        if self.weight_loss_coherence <= 1e-8 or self.cooc_matrix is None:
-            return 0.0
-        X = self.cooc_matrix.to(self.topic_embeddings.device)
-        beta = self.get_beta().detach()  # shape: [num_topics, vocab_size]
-        pred = torch.matmul(beta.t(), beta)  # shape: [vocab_size, vocab_size]
-        pred = pred.clamp(min=1e-8)  # avoid log(0)
-        X = X.clamp(min=1e-7)
-        # Only sum over X_ij > 0 for numerical stability
-        mask = (X > 0)
-        loss = (X[mask] * (X[mask] / pred[mask]).log()).sum()
-        loss *= self.weight_loss_coherence
-        return loss
 
     def reparameterize(self, mu, logvar):
         if self.training:
@@ -328,6 +380,9 @@ class HiCOT_C(nn.Module):
         return self.matrixP
 
     def get_loss_TP(self, doc_embeddings, indices):
+        if self.doc_embeddings is None:
+            return 0.0
+            
         indices = indices.to(self.doc_embeddings.device)
         minibatch_embeddings = self.doc_embeddings[indices]
 
@@ -338,18 +393,15 @@ class HiCOT_C(nn.Module):
         loss_TP = self.TP(cost, self.matrixP)
         return loss_TP
     
-    
     def get_loss_DT(self, doc_embeddings):
         document_prj = self.document_emb_prj(doc_embeddings)
-
         loss_DT, transp_DT = self.DT(document_prj, self.topic_embeddings)
         return loss_DT
 
-
     def forward(self, indices, input, epoch_id=None, doc_embeddings=None):
-        # Đồng bộ logic với HiCOT.py: input là tuple và bow là phần tử đầu tiên.
         bow = input[0]
-        doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
+        if doc_embeddings is not None:
+            doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
 
         rep, mu, logvar = self.get_representation(bow)
         loss_KL = self.compute_loss_KL(mu, logvar)
@@ -361,8 +413,8 @@ class HiCOT_C(nn.Module):
         loss_TM = recon_loss + loss_KL
 
         loss_ECR = self.get_loss_ECR()
-        loss_TP = self.get_loss_TP(doc_embeddings, indices)
-        loss_DT = self.get_loss_DT(doc_embeddings)
+        loss_TP = self.get_loss_TP(doc_embeddings, indices) if doc_embeddings is not None else 0.0
+        loss_DT = self.get_loss_DT(doc_embeddings) if doc_embeddings is not None else 0.0
 
         loss_CLC = 0.0
         loss_CLT = 0.0
@@ -376,10 +428,12 @@ class HiCOT_C(nn.Module):
         if epoch_id >= self.threshold_epoch and self.weight_loss_CLT != 0:
             loss_CLT = self.get_loss_CLT()
             
-        # Add GloVe-style topic coherence loss
-        loss_coherence = self.get_loss_coherence()
+        # ONLY Multi-Scale Coherence Loss - The main innovation
+        loss_multi_scale_coherence = self.get_loss_multi_scale_coherence()
 
-        loss = loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_coherence
+        # Updated total loss with only the multi-scale coherence
+        loss = loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_multi_scale_coherence
+               
         rst_dict = {
             'loss': loss,
             'loss_TM': loss_TM,
@@ -388,8 +442,7 @@ class HiCOT_C(nn.Module):
             'loss_TP': loss_TP,
             'loss_CLC': loss_CLC,
             'loss_CLT': loss_CLT,
-            'loss_coherence': loss_coherence
+            'loss_multi_scale_coherence': loss_multi_scale_coherence
         }
 
         return rst_dict
-

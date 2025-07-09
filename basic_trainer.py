@@ -36,8 +36,10 @@ class BasicTrainer:
     
     def make_lr_scheduler(self, optimizer):
         if self.lr_scheduler == "StepLR":
+            # lr_scheduler = StepLR(
+            #     optimizer, step_size=self.lr_step_size, gamma=0.5, verbose=False)
             lr_scheduler = StepLR(
-                optimizer, step_size=self.lr_step_size, gamma=0.5, verbose=False)
+                optimizer, step_size=self.lr_step_size, gamma=0.5)
         else:
             raise NotImplementedError(self.lr_scheduler)
         return lr_scheduler
@@ -46,7 +48,7 @@ class BasicTrainer:
         self.train(dataset_handler, verbose)
         top_words = self.export_top_words(dataset_handler.vocab, num_top_words)
     
-        if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C':
+        if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced':
             train_theta = self.test(dataset_handler.train_data, dataset_handler.doc_embeddings)
         else:
             print(f"Wrong model")
@@ -68,7 +70,7 @@ class BasicTrainer:
             loss_rst_dict = defaultdict(float)
 
             for batch_id, batch in enumerate(dataset_handler.train_dataloader): 
-                if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C':
+                if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced':
                     *inputs, indices, doc_embeddings = batch
                 else:
                     print(f"Wrong model")

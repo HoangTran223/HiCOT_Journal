@@ -4,6 +4,7 @@ import numpy as np
 import basic_trainer
 from HiCOT.HiCOT import HiCOT
 from HiCOT.HiCOT_C import HiCOT_C
+from HiCOT.HiCOT_Enhanced import HiCOT_Enhanced
 import evaluations
 import datasethandler
 import scipy
@@ -38,9 +39,11 @@ if __name__ == "__main__":
     config.add_model_argument(parser)
     config.add_training_argument(parser)
     config.add_eval_argument(parser)
-    # Thêm dòng này để nhận weight_loss_coherence từ command line
+    # Enhanced coherence parameters - CHỈ GIỮ LẠI MULTI-SCALE COHERENCE
     parser.add_argument('--weight_loss_coherence', type=float, default=1.0)
-    parser.add_argument('--cooc_norm', type=str, default='log')
+    parser.add_argument('--coherence_window_sizes', nargs='+', type=int, default=[2, 5, 10])
+    parser.add_argument('--coherence_norm', type=str, default='pmi')
+    parser.add_argument('--coherence_top_k', type=int, default=15)
     args = parser.parse_args()
 
     current_time = miscellaneous.get_current_datetime()
@@ -125,6 +128,40 @@ if __name__ == "__main__":
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
 
+    elif args.model == "HiCOT_Enhanced":
+        model = HiCOT_Enhanced(
+            vocab_size=dataset.vocab_size,
+            data_name=args.dataset,
+            num_topics=args.num_topics,
+            dropout=args.dropout,
+            pretrained_WE=pretrainWE if args.use_pretrainWE else None,
+            weight_loss_ECR=args.weight_ECR,
+            alpha_ECR=args.alpha_ECR,
+            weight_loss_TP=args.weight_loss_TP,
+            weight_loss_DT=args.weight_loss_DT,
+            alpha_TP=args.alpha_TP,
+            alpha_DT=args.alpha_DT,
+            beta_temp=args.beta_temp,
+            vocab=dataset.vocab,
+            weight_loss_CLC=args.weight_loss_CLC,
+            max_clusters=args.max_clusters,
+            weight_loss_CLT=args.weight_loss_CLT,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
+            method_CL=args.method_CL,
+            metric_CL=args.metric_CL,
+            # CHỈ GIỮ LẠI Multi-Scale Coherence parameters
+            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
+            coherence_window_sizes=getattr(args, 'coherence_window_sizes', [2, 5, 10]),
+            coherence_norm=getattr(args, 'coherence_norm', 'pmi'),
+            coherence_top_k=getattr(args, 'coherence_top_k', 15),
+            train_data=dataset.train_bow,
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
     else:
         print(f"Wrong model")
 
@@ -179,8 +216,7 @@ if __name__ == "__main__":
         os.path.join(current_run_dir, 'top_words_15.txt'))
     print(f"TC_15: {TC_15:.5f}")
 
-
-    filename = f"results_{args.dataset}_topics{args.num_topics}_epochs{args.epochs}_w_ECR{args.weight_ECR}_w_TP{args.weight_loss_TP}_w_DT{args.weight_loss_DT}_w_CLC{args.weight_loss_CLC}_w_CLT{args.weight_loss_CLT}_threshold_epoch{args.threshold_epoch}_threshold_{args.threshold_cluster}.txt"
+    filename = f"results_{args.dataset}_topics{args.num_topics}_epochs{args.epochs}_model{args.model}.txt"
     filename = filename.replace(' ', '_')
     filepath = os.path.join(current_run_dir, filename)
     with open(filepath, 'w') as f:
