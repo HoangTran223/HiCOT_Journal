@@ -252,18 +252,44 @@ class HiCOT_C(nn.Module):
         return beta
 
     def get_loss_coherence(self):
+        """
+        FIXED: GloVe-style coherence loss with proper gradients
+        """
         if self.weight_loss_coherence <= 1e-8 or self.cooc_matrix is None:
-            return 0.0
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
+            
         X = self.cooc_matrix.to(self.topic_embeddings.device)
-        beta = self.get_beta().detach()  # shape: [num_topics, vocab_size]
+        
+        # DON'T DETACH! Keep gradients flowing
+        beta = self.get_beta()  # shape: [num_topics, vocab_size] - WITH GRADIENTS!
+        
+        # Compute word-word co-occurrence prediction from topic distributions
         pred = torch.matmul(beta.t(), beta)  # shape: [vocab_size, vocab_size]
         pred = pred.clamp(min=1e-8)  # avoid log(0)
+        
+        # Ensure X has proper values
         X = X.clamp(min=1e-7)
+        
+        # Compute coherence loss using KL divergence style
         # Only sum over X_ij > 0 for numerical stability
         mask = (X > 0)
-        loss = (X[mask] * (X[mask] / pred[mask]).log()).sum()
-        loss *= self.weight_loss_coherence
-        return loss
+        
+        if torch.sum(mask) == 0:
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
+            
+        # KL-divergence style loss: sum(X_ij * log(X_ij / pred_ij))
+        # We want to minimize this, so pred should match X
+        X_masked = X[mask]
+        pred_masked = pred[mask]
+        
+        # Add small epsilon for numerical stability
+        coherence_loss = torch.sum(X_masked * torch.log((X_masked + 1e-8) / (pred_masked + 1e-8)))
+        
+        # Alternative: Use MSE loss which might be more stable
+        # coherence_loss = F.mse_loss(pred, X)
+        
+        final_loss = self.weight_loss_coherence * coherence_loss
+        return final_loss
 
     def reparameterize(self, mu, logvar):
         if self.training:
@@ -349,7 +375,8 @@ class HiCOT_C(nn.Module):
     def forward(self, indices, input, epoch_id=None, doc_embeddings=None):
         # Đồng bộ logic với HiCOT.py: input là tuple và bow là phần tử đầu tiên.
         bow = input[0]
-        doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
+        if doc_embeddings is not None:
+            doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
 
         rep, mu, logvar = self.get_representation(bow)
         loss_KL = self.compute_loss_KL(mu, logvar)
@@ -361,8 +388,8 @@ class HiCOT_C(nn.Module):
         loss_TM = recon_loss + loss_KL
 
         loss_ECR = self.get_loss_ECR()
-        loss_TP = self.get_loss_TP(doc_embeddings, indices)
-        loss_DT = self.get_loss_DT(doc_embeddings)
+        loss_TP = self.get_loss_TP(doc_embeddings, indices) if doc_embeddings is not None else 0.0
+        loss_DT = self.get_loss_DT(doc_embeddings) if doc_embeddings is not None else 0.0
 
         loss_CLC = 0.0
         loss_CLT = 0.0
@@ -376,10 +403,11 @@ class HiCOT_C(nn.Module):
         if epoch_id >= self.threshold_epoch and self.weight_loss_CLT != 0:
             loss_CLT = self.get_loss_CLT()
             
-        # Add GloVe-style topic coherence loss
+        # FIXED: Add GloVe-style topic coherence loss WITH GRADIENTS
         loss_coherence = self.get_loss_coherence()
 
         loss = loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_coherence
+        
         rst_dict = {
             'loss': loss,
             'loss_TM': loss_TM,
