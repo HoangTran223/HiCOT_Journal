@@ -96,9 +96,17 @@ class BasicTrainer:
             if verbose and epoch % self.log_interval == 0:
                 output_log = f'Epoch: {epoch:03d}'
                 for key in loss_rst_dict:
-                    output_log += f' {key}: {loss_rst_dict[key] / data_size :.3f}'
+                    loss_val = loss_rst_dict[key] / data_size
+                    output_log += f' {key}: {loss_val:.6f}'  # More precision for small values
+
+                # Special logging for coherence loss
+                if hasattr(self.model, 'get_loss_multi_scale_coherence'):
+                    with torch.no_grad():
+                        coherence_loss = self.model.get_loss_multi_scale_coherence()
+                        output_log += f' coherence_check: {coherence_loss:.6f}'
 
                 self.logger.info(output_log)
+                print(output_log)  # Also print to console
 
     def test(self, input_data, train_data=None):
         data_size = input_data.shape[0]

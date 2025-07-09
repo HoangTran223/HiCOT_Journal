@@ -129,6 +129,13 @@ if __name__ == "__main__":
         print(f"Number of trainable parameters: {trainable_params}")
 
     elif args.model == "HiCOT_Enhanced":
+        # Validate coherence parameters
+        print(f"Coherence parameters:")
+        print(f"  weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
+        print(f"  coherence_window_sizes: {getattr(args, 'coherence_window_sizes', [2, 5, 10])}")
+        print(f"  coherence_norm: {getattr(args, 'coherence_norm', 'pmi')}")
+        print(f"  coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
+        
         model = HiCOT_Enhanced(
             vocab_size=dataset.vocab_size,
             data_name=args.dataset,
@@ -161,6 +168,12 @@ if __name__ == "__main__":
         model = model.to(args.device)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
+        
+        # Test coherence loss immediately after model creation
+        print("Testing coherence loss computation...")
+        with torch.no_grad():
+            test_loss = model.get_loss_multi_scale_coherence()
+            print(f"Initial coherence loss: {test_loss}")
 
     else:
         print(f"Wrong model")

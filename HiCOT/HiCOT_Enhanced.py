@@ -144,56 +144,82 @@ class HiCOT_Enhanced(nn.Module):
                 logging.info(f"Saved enhanced co-occurrence matrix (window={window_size}) to {cooc_matrix_path}")
 
     def _build_window_cooccurrence(self, train_data, vocab, window_size):
-        """Build co-occurrence matrix for specific window size - OPTIMIZED VERSION"""
+        """Build co-occurrence matrix for specific window size - FIXED VERSION"""
         V = len(vocab)
         cooc_matrix = np.zeros((V, V), dtype=np.float32)
         
-        # FASTER: Use simple co-occurrence without distance weighting to speed up
+        # Handle BOW data properly
         if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
-            # For BOW data, use simple word co-occurrence within documents
-            for doc in train_data:
-                words = np.where(doc > 0)[0]  # Get non-zero word indices
-                if len(words) < 2:
+            # Convert BOW to sequences for proper window-based co-occurrence
+            for doc_idx, doc in enumerate(train_data):
+                if doc_idx % 1000 == 0:
+                    print(f"Processing document {doc_idx}/{len(train_data)}")
+                
+                # Convert BOW to word sequence
+                word_sequence = []
+                for word_idx, count in enumerate(doc):
+                    if count > 0:
+                        # Add words proportional to their count (but limit to avoid huge sequences)
+                        word_sequence.extend([word_idx] * min(int(count), 5))
+                
+                if len(word_sequence) < 2:
                     continue
+                
+                # Sliding window co-occurrence
+                for i in range(len(word_sequence)):
+                    center_word = word_sequence[i]
+                    start = max(0, i - window_size)
+                    end = min(len(word_sequence), i + window_size + 1)
                     
-                # Simple pairwise co-occurrence (much faster than window-based)
-                for i in range(len(words)):
-                    for j in range(len(words)):
-                        if i != j and words[i] < V and words[j] < V:
-                            cooc_matrix[words[i], words[j]] += 1
+                    for j in range(start, end):
+                        if i != j and center_word < V and word_sequence[j] < V:
+                            # Distance-weighted co-occurrence
+                            distance = abs(i - j)
+                            weight = 1.0 / distance if distance > 0 else 1.0
+                            cooc_matrix[center_word, word_sequence[j]] += weight
         
         return cooc_matrix
 
     def _compute_pmi_matrix(self, cooc_matrix, train_data, vocab):
-        """Compute PMI normalization - VECTORIZED VERSION"""
+        """Compute PMI normalization - FIXED VERSION"""
         V = len(vocab)
         
-        # Calculate word frequencies - VECTORIZED
+        # Calculate word frequencies from original data
         if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
             word_counts = np.sum(train_data, axis=0)
         else:
             word_counts = np.zeros(V)
             for doc in train_data:
                 unique_words, counts = np.unique(doc, return_counts=True)
-                word_counts[unique_words] += counts
+                valid_mask = unique_words < V
+                word_counts[unique_words[valid_mask]] += counts[valid_mask]
         
         total_count = np.sum(word_counts)
         word_probs = word_counts / (total_count + 1e-8)
         
-        # VECTORIZED PMI computation - much faster
-        cooc_matrix_smooth = cooc_matrix + 1e-8
-        joint_probs = cooc_matrix_smooth / (np.sum(cooc_matrix_smooth) + 1e-8)
+        # Ensure minimum probability
+        word_probs = np.maximum(word_probs, 1e-8)
         
-        # Create probability matrices
+        # PMI computation with proper normalization
+        cooc_total = np.sum(cooc_matrix)
+        if cooc_total > 0:
+            joint_probs = cooc_matrix / cooc_total
+        else:
+            joint_probs = cooc_matrix + 1e-8
+        
+        # Vectorized PMI calculation
         word_probs_i = word_probs[:, np.newaxis]  # [V, 1]
         word_probs_j = word_probs[np.newaxis, :]  # [1, V]
         expected_joint = word_probs_i * word_probs_j  # [V, V]
         
-        # Vectorized PMI calculation
+        # PMI = log(P(i,j) / (P(i) * P(j)))
         pmi_matrix = np.log((joint_probs + 1e-8) / (expected_joint + 1e-8))
         
-        # Clip negative PMI values
+        # Clip negative PMI values and normalize to [0,1]
         pmi_matrix = np.maximum(pmi_matrix, 0)
+        if np.max(pmi_matrix) > 0:
+            pmi_matrix = pmi_matrix / np.max(pmi_matrix)
+        
         return pmi_matrix
 
     def get_beta(self):
@@ -204,55 +230,70 @@ class HiCOT_Enhanced(nn.Module):
 
     def get_loss_multi_scale_coherence(self):
         """
-        OPTIMIZED Multi-scale coherence loss - MUCH FASTER VERSION
+        FIXED Multi-scale coherence loss - Ensure it actually works
         """
         if self.weight_loss_coherence <= 1e-8 or not self.cooc_matrices:
-            return 0.0
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
             
-        beta = self.get_beta().detach()  # [num_topics, vocab_size]
+        beta = self.get_beta()  # [num_topics, vocab_size] - KEEP GRADIENTS!
         total_coherence_loss = 0.0
+        num_valid_windows = 0
         
-        # OPTIMIZATION 1: Use only the most important window size to speed up
-        # Instead of all window sizes, use only the smallest one (most local coherence)
-        primary_window = min(self.coherence_window_sizes)
-        if primary_window in self.cooc_matrices:
-            X = self.cooc_matrices[primary_window].to(self.topic_embeddings.device)
+        # Use ALL window sizes, not just primary one
+        for window_size in self.coherence_window_sizes:
+            if window_size not in self.cooc_matrices:
+                continue
+                
+            X = self.cooc_matrices[window_size].to(self.topic_embeddings.device)
             
-            # OPTIMIZATION 2: Vectorized top-k computation
-            top_k_indices = torch.topk(beta, k=self.coherence_top_k, dim=1)[1]  # [num_topics, k]
+            # Get top-k words for each topic
+            top_k_values, top_k_indices = torch.topk(beta, k=self.coherence_top_k, dim=1)  # [num_topics, k]
             
-            # OPTIMIZATION 3: Batch process coherence calculation
-            coherence_loss = 0.0
+            coherence_loss_window = 0.0
+            num_valid_topics = 0
+            
             for topic_idx in range(self.num_topics):
                 topic_words = top_k_indices[topic_idx]  # [k]
+                topic_probs = top_k_values[topic_idx]  # [k] - WITH GRADIENTS
                 
-                # VECTORIZED pairwise coherence - much faster than nested loops
-                word_probs = beta[topic_idx, topic_words]  # [k]
+                # Normalize probabilities to sum to 1
+                topic_probs = F.softmax(topic_probs, dim=0)
                 
                 # Get co-occurrence submatrix for this topic's words
                 cooc_submatrix = X[topic_words][:, topic_words]  # [k, k]
                 
-                # Compute expected co-occurrence matrix
-                expected_cooc_matrix = word_probs.unsqueeze(1) * word_probs.unsqueeze(0)  # [k, k]
+                # Compute pairwise coherence using PMI-style calculation
+                coherence_topic = 0.0
+                valid_pairs = 0
                 
-                # Mask out diagonal (self co-occurrence)
-                mask = ~torch.eye(len(topic_words), dtype=torch.bool, device=X.device)
+                for i in range(self.coherence_top_k):
+                    for j in range(i+1, self.coherence_top_k):  # Only upper triangle
+                        cooc_val = cooc_submatrix[i, j]
+                        if cooc_val > 1e-6:  # Only consider non-zero co-occurrences
+                            # PMI-style coherence: log(P(w_i, w_j) / (P(w_i) * P(w_j)))
+                            joint_prob = cooc_val  # Already normalized in build phase
+                            marginal_i = topic_probs[i]
+                            marginal_j = topic_probs[j]
+                            
+                            if marginal_i > 1e-8 and marginal_j > 1e-8:
+                                pmi_score = torch.log(joint_prob + 1e-8) - torch.log(marginal_i + 1e-8) - torch.log(marginal_j + 1e-8)
+                                coherence_topic += pmi_score
+                                valid_pairs += 1
                 
-                # Vectorized coherence computation
-                actual_cooc = cooc_submatrix[mask]
-                expected_cooc = expected_cooc_matrix[mask]
-                
-                # Only consider non-zero co-occurrences
-                valid_mask = actual_cooc > 1e-8
-                if torch.sum(valid_mask) > 0:
-                    coherence_loss += torch.sum(
-                        expected_cooc[valid_mask] * torch.log(actual_cooc[valid_mask] + 1e-8)
-                    )
+                if valid_pairs > 0:
+                    coherence_loss_window += coherence_topic / valid_pairs
+                    num_valid_topics += 1
             
-            total_coherence_loss = coherence_loss
+            if num_valid_topics > 0:
+                total_coherence_loss += coherence_loss_window / num_valid_topics
+                num_valid_windows += 1
         
-        # Return negative loss (we want to maximize coherence)
-        return -self.weight_loss_coherence * total_coherence_loss
+        if num_valid_windows > 0:
+            final_loss = total_coherence_loss / num_valid_windows
+            # Return NEGATIVE loss (we want to MAXIMIZE coherence)
+            return -self.weight_loss_coherence * final_loss
+        else:
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
 
     def create_group_topic(self):
         with torch.no_grad():  
