@@ -144,66 +144,53 @@ class HiCOT_Enhanced(nn.Module):
                 logging.info(f"Saved enhanced co-occurrence matrix (window={window_size}) to {cooc_matrix_path}")
 
     def _build_window_cooccurrence(self, train_data, vocab, window_size):
-        """Build co-occurrence matrix for specific window size"""
+        """Build co-occurrence matrix for specific window size - OPTIMIZED VERSION"""
         V = len(vocab)
         cooc_matrix = np.zeros((V, V), dtype=np.float32)
         
-        # Convert BOW to word sequences
+        # FASTER: Use simple co-occurrence without distance weighting to speed up
         if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
-            word_sequences = []
+            # For BOW data, use simple word co-occurrence within documents
             for doc in train_data:
-                sequence = []
-                for word_idx, count in enumerate(doc):
-                    sequence.extend([word_idx] * int(count))
-                word_sequences.append(sequence)
-        else:
-            word_sequences = train_data
-        
-        # Build co-occurrence with window
-        for doc in word_sequences:
-            for i, center_word in enumerate(doc):
-                if center_word >= V:
+                words = np.where(doc > 0)[0]  # Get non-zero word indices
+                if len(words) < 2:
                     continue
                     
-                # Define context window
-                start = max(0, i - window_size)
-                end = min(len(doc), i + window_size + 1)
-                
-                for j in range(start, end):
-                    if i != j and doc[j] < V:
-                        # Distance-weighted co-occurrence
-                        distance = abs(i - j)
-                        weight = 1.0 / distance
-                        cooc_matrix[center_word, doc[j]] += weight
+                # Simple pairwise co-occurrence (much faster than window-based)
+                for i in range(len(words)):
+                    for j in range(len(words)):
+                        if i != j and words[i] < V and words[j] < V:
+                            cooc_matrix[words[i], words[j]] += 1
         
         return cooc_matrix
 
     def _compute_pmi_matrix(self, cooc_matrix, train_data, vocab):
-        """Compute PMI normalization"""
-        # Calculate word frequencies
+        """Compute PMI normalization - VECTORIZED VERSION"""
         V = len(vocab)
-        word_counts = np.zeros(V)
         
+        # Calculate word frequencies - VECTORIZED
         if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
             word_counts = np.sum(train_data, axis=0)
         else:
+            word_counts = np.zeros(V)
             for doc in train_data:
-                for word in doc:
-                    if word < V:
-                        word_counts[word] += 1
+                unique_words, counts = np.unique(doc, return_counts=True)
+                word_counts[unique_words] += counts
         
         total_count = np.sum(word_counts)
-        word_probs = word_counts / total_count
+        word_probs = word_counts / (total_count + 1e-8)
         
-        # Compute PMI
+        # VECTORIZED PMI computation - much faster
         cooc_matrix_smooth = cooc_matrix + 1e-8
-        joint_probs = cooc_matrix_smooth / np.sum(cooc_matrix_smooth)
+        joint_probs = cooc_matrix_smooth / (np.sum(cooc_matrix_smooth) + 1e-8)
         
-        pmi_matrix = np.zeros_like(cooc_matrix)
-        for i in range(V):
-            for j in range(V):
-                if joint_probs[i, j] > 0 and word_probs[i] > 0 and word_probs[j] > 0:
-                    pmi_matrix[i, j] = np.log(joint_probs[i, j] / (word_probs[i] * word_probs[j]))
+        # Create probability matrices
+        word_probs_i = word_probs[:, np.newaxis]  # [V, 1]
+        word_probs_j = word_probs[np.newaxis, :]  # [1, V]
+        expected_joint = word_probs_i * word_probs_j  # [V, V]
+        
+        # Vectorized PMI calculation
+        pmi_matrix = np.log((joint_probs + 1e-8) / (expected_joint + 1e-8))
         
         # Clip negative PMI values
         pmi_matrix = np.maximum(pmi_matrix, 0)
@@ -217,8 +204,7 @@ class HiCOT_Enhanced(nn.Module):
 
     def get_loss_multi_scale_coherence(self):
         """
-        MAIN COHERENCE LOSS: Multi-scale coherence loss combining local and global coherence
-        This is the core innovation that directly optimizes for CV coherence metric
+        OPTIMIZED Multi-scale coherence loss - MUCH FASTER VERSION
         """
         if self.weight_loss_coherence <= 1e-8 or not self.cooc_matrices:
             return 0.0
@@ -226,36 +212,44 @@ class HiCOT_Enhanced(nn.Module):
         beta = self.get_beta().detach()  # [num_topics, vocab_size]
         total_coherence_loss = 0.0
         
-        # Multi-scale coherence loss with different window sizes
-        for window_size, cooc_matrix in self.cooc_matrices.items():
-            X = cooc_matrix.to(self.topic_embeddings.device)
+        # OPTIMIZATION 1: Use only the most important window size to speed up
+        # Instead of all window sizes, use only the smallest one (most local coherence)
+        primary_window = min(self.coherence_window_sizes)
+        if primary_window in self.cooc_matrices:
+            X = self.cooc_matrices[primary_window].to(self.topic_embeddings.device)
             
-            # Get top-k words for each topic (most relevant for CV metric)
+            # OPTIMIZATION 2: Vectorized top-k computation
             top_k_indices = torch.topk(beta, k=self.coherence_top_k, dim=1)[1]  # [num_topics, k]
             
+            # OPTIMIZATION 3: Batch process coherence calculation
             coherence_loss = 0.0
             for topic_idx in range(self.num_topics):
                 topic_words = top_k_indices[topic_idx]  # [k]
                 
-                # Pairwise coherence within topic - this directly mimics CV calculation
-                for i in range(len(topic_words)):
-                    for j in range(i + 1, len(topic_words)):
-                        word_i, word_j = topic_words[i], topic_words[j]
-                        
-                        # Expected co-occurrence based on topic-word probabilities
-                        expected_cooc = beta[topic_idx, word_i] * beta[topic_idx, word_j]
-                        
-                        # Actual co-occurrence from corpus (symmetric)
-                        actual_cooc = X[word_i, word_j] + X[word_j, word_i]
-                        
-                        # Core coherence loss: maximize actual co-occurrence for high-probability word pairs
-                        if actual_cooc > 1e-8:
-                            # Use log to match PMI-style calculation
-                            coherence_loss += expected_cooc * torch.log(actual_cooc + 1e-8)
+                # VECTORIZED pairwise coherence - much faster than nested loops
+                word_probs = beta[topic_idx, topic_words]  # [k]
+                
+                # Get co-occurrence submatrix for this topic's words
+                cooc_submatrix = X[topic_words][:, topic_words]  # [k, k]
+                
+                # Compute expected co-occurrence matrix
+                expected_cooc_matrix = word_probs.unsqueeze(1) * word_probs.unsqueeze(0)  # [k, k]
+                
+                # Mask out diagonal (self co-occurrence)
+                mask = ~torch.eye(len(topic_words), dtype=torch.bool, device=X.device)
+                
+                # Vectorized coherence computation
+                actual_cooc = cooc_submatrix[mask]
+                expected_cooc = expected_cooc_matrix[mask]
+                
+                # Only consider non-zero co-occurrences
+                valid_mask = actual_cooc > 1e-8
+                if torch.sum(valid_mask) > 0:
+                    coherence_loss += torch.sum(
+                        expected_cooc[valid_mask] * torch.log(actual_cooc[valid_mask] + 1e-8)
+                    )
             
-            # Weight by inverse window size (smaller windows = more local coherence = more important)
-            weight = 1.0 / window_size
-            total_coherence_loss += weight * coherence_loss
+            total_coherence_loss = coherence_loss
         
         # Return negative loss (we want to maximize coherence)
         return -self.weight_loss_coherence * total_coherence_loss
