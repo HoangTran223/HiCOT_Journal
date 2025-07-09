@@ -3,8 +3,9 @@ import torch
 from collections import defaultdict
 from scipy.sparse import csr_matrix
 import logging
+from torch import nn
 
-class AdvancedCooccurrenceBuilder:
+class AdvancedCooccurrenceBuilder(nn.Module):
     """
     Advanced co-occurrence matrix builder with multiple coherence metrics
     """
