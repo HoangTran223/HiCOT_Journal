@@ -95,10 +95,12 @@ class HiCOT_C(nn.Module):
         self.cooc_norm = cooc_norm
         self.cooc_window_size = cooc_window_size
         self.cooc_matrix = None
+        
+        # FIXED: Proper co-occurrence matrix building
         if train_data is not None and vocab is not None:
             precomputed_dir = 'precomputed'
             os.makedirs(precomputed_dir, exist_ok=True)
-            cooc_matrix_path = os.path.join(precomputed_dir, f'cooc_{data_name}.npy')
+            cooc_matrix_path = os.path.join(precomputed_dir, f'cooc_{data_name}_{cooc_norm}_w{cooc_window_size}.npy')
 
             if os.path.exists(cooc_matrix_path):
                 logging.info(f"Loading co-occurrence matrix from {cooc_matrix_path}")
@@ -107,12 +109,38 @@ class HiCOT_C(nn.Module):
             else:
                 logging.info(f"Building co-occurrence matrix for {data_name}...")
                 cooc_matrix_np = build_cooccurrence_matrix(
-                    train_data, vocab, norm=cooc_norm
+                    train_data, vocab, norm=cooc_norm, window_size=cooc_window_size
                 )
+                
+                # CRITICAL: Ensure matrix is not all zeros
+                if np.sum(cooc_matrix_np) == 0:
+                    logging.warning("Co-occurrence matrix is all zeros! Using simple word co-occurrence.")
+                    cooc_matrix_np = self._build_simple_cooccurrence(train_data, vocab)
+                
                 logging.info(f"Saving co-occurrence matrix to {cooc_matrix_path}")
                 np.save(cooc_matrix_path, cooc_matrix_np)
                 self.cooc_matrix = torch.tensor(cooc_matrix_np, dtype=torch.float32)
+                
+            logging.info(f"Co-occurrence matrix stats: max={torch.max(self.cooc_matrix):.6f}, mean={torch.mean(self.cooc_matrix):.6f}, non_zero={torch.count_nonzero(self.cooc_matrix)}")
 
+    def _build_simple_cooccurrence(self, train_data, vocab):
+        """Fallback: simple document-level co-occurrence when sliding window fails"""
+        V = len(vocab)
+        cooc_matrix = np.zeros((V, V), dtype=np.float32)
+        
+        if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
+            for doc in train_data:
+                words = np.where(doc > 0)[0]  # Get words present in document
+                for i in range(len(words)):
+                    for j in range(len(words)):
+                        if i != j and words[i] < V and words[j] < V:
+                            cooc_matrix[words[i], words[j]] += 1
+        
+        # Normalize by max value
+        if np.max(cooc_matrix) > 0:
+            cooc_matrix = cooc_matrix / np.max(cooc_matrix)
+        
+        return cooc_matrix
 
     def create_group_topic(self):
         with torch.no_grad():  
@@ -253,42 +281,42 @@ class HiCOT_C(nn.Module):
 
     def get_loss_coherence(self):
         """
-        FIXED: GloVe-style coherence loss with proper gradients
+        COMPLETELY FIXED: GloVe-style coherence loss with proper gradients and validation
         """
         if self.weight_loss_coherence <= 1e-8 or self.cooc_matrix is None:
             return torch.tensor(0.0, device=self.topic_embeddings.device)
             
         X = self.cooc_matrix.to(self.topic_embeddings.device)
         
-        # DON'T DETACH! Keep gradients flowing
+        # Check if co-occurrence matrix is meaningful
+        if torch.sum(X) < 1e-6:
+            logging.warning("Co-occurrence matrix is nearly empty, skipping coherence loss")
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
+        
+        # Get beta WITH gradients - this is crucial!
         beta = self.get_beta()  # shape: [num_topics, vocab_size] - WITH GRADIENTS!
         
-        # Compute word-word co-occurrence prediction from topic distributions
+        # Compute predicted co-occurrence from topic-word distributions
         pred = torch.matmul(beta.t(), beta)  # shape: [vocab_size, vocab_size]
-        pred = pred.clamp(min=1e-8)  # avoid log(0)
+        pred = pred.clamp(min=1e-8)  # avoid division by zero
         
-        # Ensure X has proper values
-        X = X.clamp(min=1e-7)
+        # Normalize X to have reasonable scale
+        X = X.clamp(min=1e-8)
         
-        # Compute coherence loss using KL divergence style
-        # Only sum over X_ij > 0 for numerical stability
-        mask = (X > 0)
+        # Use Frobenius norm loss instead of KL divergence for stability
+        coherence_loss = F.mse_loss(pred, X)
         
-        if torch.sum(mask) == 0:
-            return torch.tensor(0.0, device=self.topic_embeddings.device)
-            
-        # KL-divergence style loss: sum(X_ij * log(X_ij / pred_ij))
-        # We want to minimize this, so pred should match X
-        X_masked = X[mask]
-        pred_masked = pred[mask]
-        
-        # Add small epsilon for numerical stability
-        coherence_loss = torch.sum(X_masked * torch.log((X_masked + 1e-8) / (pred_masked + 1e-8)))
-        
-        # Alternative: Use MSE loss which might be more stable
-        # coherence_loss = F.mse_loss(pred, X)
+        # Alternative: Use only upper triangle to avoid diagonal dominance
+        # mask = torch.triu(torch.ones_like(X), diagonal=1).bool()
+        # coherence_loss = F.mse_loss(pred[mask], X[mask])
         
         final_loss = self.weight_loss_coherence * coherence_loss
+        
+        # Log for debugging
+        if torch.isnan(final_loss) or torch.isinf(final_loss):
+            logging.warning(f"Invalid coherence loss: {final_loss}, setting to 0")
+            return torch.tensor(0.0, device=self.topic_embeddings.device)
+        
         return final_loss
 
     def reparameterize(self, mu, logvar):
@@ -373,10 +401,16 @@ class HiCOT_C(nn.Module):
 
 
     def forward(self, indices, input, epoch_id=None, doc_embeddings=None):
-        # Đồng bộ logic với HiCOT.py: input là tuple và bow là phần tử đầu tiên.
+        # FIXED: Proper input handling
         bow = input[0]
+        
+        # FIXED: Proper device handling for doc_embeddings
         if doc_embeddings is not None:
             doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
+        else:
+            # Use stored doc_embeddings if available
+            if hasattr(self, 'doc_embeddings') and self.doc_embeddings is not None:
+                doc_embeddings = self.doc_embeddings
 
         rep, mu, logvar = self.get_representation(bow)
         loss_KL = self.compute_loss_KL(mu, logvar)
@@ -388,22 +422,29 @@ class HiCOT_C(nn.Module):
         loss_TM = recon_loss + loss_KL
 
         loss_ECR = self.get_loss_ECR()
-        loss_TP = self.get_loss_TP(doc_embeddings, indices) if doc_embeddings is not None else 0.0
-        loss_DT = self.get_loss_DT(doc_embeddings) if doc_embeddings is not None else 0.0
+        
+        # FIXED: Proper conditional loss calculation
+        loss_TP = 0.0
+        loss_DT = 0.0
+        if doc_embeddings is not None:
+            loss_TP = self.get_loss_TP(doc_embeddings, indices)
+            loss_DT = self.get_loss_DT(doc_embeddings)
 
         loss_CLC = 0.0
         loss_CLT = 0.0
 
-        if epoch_id >= self.threshold_epoch and (epoch_id == self.threshold_epoch or (epoch_id > self.threshold_epoch and epoch_id % self.threshold_cluster == 0)):
-            self.create_group_topic()
+        # FIXED: Proper epoch-based loss activation
+        if epoch_id is not None and epoch_id >= self.threshold_epoch:
+            if epoch_id == self.threshold_epoch or (epoch_id > self.threshold_epoch and epoch_id % self.threshold_cluster == 0):
+                self.create_group_topic()
 
-        if epoch_id >= self.threshold_epoch and self.weight_loss_CLC != 0:
-            loss_CLC = self.get_loss_CLC()
-        
-        if epoch_id >= self.threshold_epoch and self.weight_loss_CLT != 0:
-            loss_CLT = self.get_loss_CLT()
+            if self.weight_loss_CLC > 1e-8:
+                loss_CLC = self.get_loss_CLC()
             
-        # FIXED: Add GloVe-style topic coherence loss WITH GRADIENTS
+            if self.weight_loss_CLT > 1e-8:
+                loss_CLT = self.get_loss_CLT()
+        
+        # FIXED: Always compute coherence loss (not epoch-dependent)
         loss_coherence = self.get_loss_coherence()
 
         loss = loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_coherence

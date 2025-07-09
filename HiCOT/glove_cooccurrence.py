@@ -62,6 +62,21 @@ def build_cooccurrence_matrix(train_data, vocab, norm='log', window_size=5):
     print(f"Co-occurrence matrix built. Non-zero entries: {np.count_nonzero(X)}")
     print(f"Max co-occurrence value: {np.max(X)}")
     
+    # CRITICAL: Check if matrix is meaningful
+    if np.count_nonzero(X) == 0:
+        print("WARNING: Co-occurrence matrix is all zeros! Building simple document-level co-occurrence.")
+        # Fallback to simple document-level co-occurrence
+        for doc_idx, doc in enumerate(train_data[:min(1000, len(train_data))]):  # Limit to first 1000 docs
+            if isinstance(doc, np.ndarray):
+                words = np.where(doc > 0)[0]
+            else:
+                words = list(set(doc))
+            
+            for i in range(len(words)):
+                for j in range(len(words)):
+                    if i != j and words[i] < V and words[j] < V:
+                        X[words[i], words[j]] += 1
+    
     # Make symmetric
     X = (X + X.T) / 2
     
@@ -70,19 +85,23 @@ def build_cooccurrence_matrix(train_data, vocab, norm='log', window_size=5):
         if np.max(X) > 0:
             X_norm = X / np.max(X)
         else:
-            X_norm = X
+            X_norm = X + 1e-6 * np.ones_like(X)  # Add small constant if all zeros
     elif norm == 'log':
         X_log = np.log1p(X)  # log(1 + X)
         if np.max(X_log) > 0:
             X_norm = X_log / np.max(X_log)
         else:
-            X_norm = X_log
+            X_norm = X_log + 1e-6 * np.ones_like(X_log)
     elif norm == 'sqrt':
         X_norm = np.sqrt(X)
         if np.max(X_norm) > 0:
             X_norm = X_norm / np.max(X_norm)
+        else:
+            X_norm = X_norm + 1e-6 * np.ones_like(X_norm)
     else:
         X_norm = X
+        if np.max(X_norm) == 0:
+            X_norm = X_norm + 1e-6 * np.ones_like(X_norm)
         
-    print(f"Normalized matrix - Max: {np.max(X_norm):.6f}, Mean: {np.mean(X_norm):.6f}")
+    print(f"Normalized matrix - Max: {np.max(X_norm):.6f}, Mean: {np.mean(X_norm):.6f}, Non-zero: {np.count_nonzero(X_norm)}")
     return X_norm

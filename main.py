@@ -97,6 +97,11 @@ if __name__ == "__main__":
         print(f"Number of trainable parameters: {trainable_params}")
 
     elif args.model == "HiCOT_C":
+        # Validate coherence parameters
+        print(f"HiCOT_C Coherence parameters:")
+        print(f"  weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
+        print(f"  cooc_norm: {getattr(args, 'cooc_norm', 'log')}")
+        
         model = HiCOT_C(
             vocab_size=dataset.vocab_size,
             data_name=args.dataset,
@@ -122,11 +127,18 @@ if __name__ == "__main__":
             # Thêm các tham số cho loss_coherence
             weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
             cooc_norm=getattr(args, 'cooc_norm', 'log'),
-            train_data=dataset.train_bow,  # Đảm bảo truyền đúng train_bow
+            cooc_window_size=getattr(args, 'cooc_window_size', 5),  # Add window size parameter
+            train_data=dataset.train_bow,
         )
         model = model.to(args.device)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
+        
+        # Test coherence loss immediately after model creation
+        print("Testing HiCOT_C coherence loss computation...")
+        with torch.no_grad():
+            test_loss = model.get_loss_coherence()
+            print(f"Initial coherence loss: {test_loss}")
 
     elif args.model == "HiCOT_Enhanced":
         # Validate coherence parameters
