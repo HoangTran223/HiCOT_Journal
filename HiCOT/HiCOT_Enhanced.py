@@ -13,12 +13,15 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from sklearn.cluster import KMeans
 from utils import static_utils
-from .glove_cooccurrence import build_cooccurrence_matrix
 import os
 
 class HiCOT_Enhanced(nn.Module):
     """
-    Enhanced HiCOT with Multi-Scale Coherence Loss for improved topic coherence
+    Enhanced HiCOT with Topic Separation Loss and Semantic Coherence Loss
+    
+    KEY INNOVATIONS:
+    1. Topic Separation Loss - Forces topics to be well-separated (improves Purity/NMI)
+    2. Semantic Coherence Loss - Uses word embeddings similarity (improves CV)
     """
     def __init__(self, vocab_size, data_name='20NG', num_topics=50, en_units=200, dropout=0.,
                 threshold_epoch=10, doc2vec_size=384, pretrained_WE=None, embed_size=200, beta_temp=0.2, 
@@ -26,9 +29,9 @@ class HiCOT_Enhanced(nn.Module):
                 weight_loss_TP=250.0, alpha_TP=20.0, alpha_DT=3.0, weight_loss_DT=10.0, 
                 vocab=None, doc_embeddings=None, weight_loss_CLC=1.0, max_clusters=50, 
                 method_CL='HAC', metric_CL='euclidean', sinkhorn_max_iter=5000,
-                # Multi-Scale Coherence parameters only
-                weight_loss_coherence=1.0, coherence_window_sizes=[2, 5, 10], 
-                coherence_norm='pmi', coherence_top_k=15, train_data=None):
+                # NEW Enhanced parameters
+                weight_loss_topic_separation=2.0, weight_loss_semantic_coherence=1.0, 
+                weight_loss_entropy_reg=0.5, coherence_top_k=15, train_data=None):
 
         super().__init__()
 
@@ -41,7 +44,7 @@ class HiCOT_Enhanced(nn.Module):
         self.data_name = data_name
         self.vocab_size = vocab_size
 
-        # Standard parameters
+        # Standard neural topic model parameters
         self.a = 1 * np.ones((1, num_topics)).astype(np.float32)
         self.mu2 = nn.Parameter(torch.as_tensor(
             (np.log(self.a).T - np.mean(np.log(self.a), 1)).T))
@@ -100,200 +103,127 @@ class HiCOT_Enhanced(nn.Module):
         self.topics = []
         self.topic_index_mapping = {}
 
-        # Multi-Scale Coherence parameters only
-        self.weight_loss_coherence = weight_loss_coherence
-        self.coherence_window_sizes = coherence_window_sizes
-        self.coherence_norm = coherence_norm
+        # NEW Enhanced parameters
+        self.weight_loss_topic_separation = weight_loss_topic_separation
+        self.weight_loss_semantic_coherence = weight_loss_semantic_coherence
+        self.weight_loss_entropy_reg = weight_loss_entropy_reg
         self.coherence_top_k = coherence_top_k
-        self.cooc_matrices = {}
         
-        # Build multi-scale co-occurrence matrices using simple approach
+        # Cache word co-occurrence statistics from data for semantic coherence
+        self.word_cooccur_cache = None
         if train_data is not None and vocab is not None:
-            self._build_coherence_matrices(train_data, vocab)
+            self._build_word_cooccur_cache(train_data, vocab)
 
-    def _build_coherence_matrices(self, train_data, vocab):
-        """Build and cache multi-scale co-occurrence matrices using simple approach"""
-        precomputed_dir = 'precomputed'
-        os.makedirs(precomputed_dir, exist_ok=True)
-        
-        for window_size in self.coherence_window_sizes:
-            cooc_matrix_path = os.path.join(
-                precomputed_dir, 
-                f'enhanced_cooc_{self.data_name}_w{window_size}_{self.coherence_norm}.npy'
-            )
-            
-            if os.path.exists(cooc_matrix_path):
-                logging.info(f"Loading enhanced co-occurrence matrix (window={window_size}) from {cooc_matrix_path}")
-                cooc_matrix_np = np.load(cooc_matrix_path)
-                self.cooc_matrices[window_size] = torch.tensor(cooc_matrix_np, dtype=torch.float32)
-            else:
-                logging.info(f"Building enhanced co-occurrence matrix for window size {window_size}...")
-                # Use simplified co-occurrence building
-                cooc_matrix_np = self._build_window_cooccurrence(train_data, vocab, window_size)
-                
-                # Apply normalization
-                if self.coherence_norm == 'pmi':
-                    cooc_matrix_np = self._compute_pmi_matrix(cooc_matrix_np, train_data, vocab)
-                elif self.coherence_norm == 'log':
-                    cooc_matrix_np = np.log1p(cooc_matrix_np)
-                    cooc_matrix_np = cooc_matrix_np / (np.max(cooc_matrix_np) + 1e-8)
-                
-                # Save matrix
-                np.save(cooc_matrix_path, cooc_matrix_np)
-                self.cooc_matrices[window_size] = torch.tensor(cooc_matrix_np, dtype=torch.float32)
-                logging.info(f"Saved enhanced co-occurrence matrix (window={window_size}) to {cooc_matrix_path}")
-
-    def _build_window_cooccurrence(self, train_data, vocab, window_size):
-        """Build co-occurrence matrix for specific window size - FIXED VERSION"""
+    def _build_word_cooccur_cache(self, train_data, vocab):
+        """Build word co-occurrence cache for semantic coherence computation"""
         V = len(vocab)
-        cooc_matrix = np.zeros((V, V), dtype=np.float32)
+        word_cooccur = torch.zeros((V, V), dtype=torch.float32)
         
-        # Handle BOW data properly
+        logging.info("Building word co-occurrence cache...")
+        
         if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
-            # Convert BOW to sequences for proper window-based co-occurrence
+            # Document-level co-occurrence for semantic coherence
             for doc_idx, doc in enumerate(train_data):
                 if doc_idx % 1000 == 0:
-                    print(f"Processing document {doc_idx}/{len(train_data)}")
+                    print(f"Processing doc {doc_idx}/{len(train_data)}")
                 
-                # Convert BOW to word sequence
-                word_sequence = []
-                for word_idx, count in enumerate(doc):
-                    if count > 0:
-                        # Add words proportional to their count (but limit to avoid huge sequences)
-                        word_sequence.extend([word_idx] * min(int(count), 5))
-                
-                if len(word_sequence) < 2:
-                    continue
-                
-                # Sliding window co-occurrence
-                for i in range(len(word_sequence)):
-                    center_word = word_sequence[i]
-                    start = max(0, i - window_size)
-                    end = min(len(word_sequence), i + window_size + 1)
-                    
-                    for j in range(start, end):
-                        if i != j and center_word < V and word_sequence[j] < V:
-                            # Distance-weighted co-occurrence
-                            distance = abs(i - j)
-                            weight = 1.0 / distance if distance > 0 else 1.0
-                            cooc_matrix[center_word, word_sequence[j]] += weight
+                words = np.where(doc > 0)[0]  # Words present in document
+                if len(words) > 1:
+                    # All pairs of words in document co-occur
+                    for i in range(len(words)):
+                        for j in range(i+1, len(words)):
+                            if words[i] < V and words[j] < V:
+                                word_cooccur[words[i], words[j]] += 1
+                                word_cooccur[words[j], words[i]] += 1
         
-        return cooc_matrix
-
-    def _compute_pmi_matrix(self, cooc_matrix, train_data, vocab):
-        """Compute PMI normalization - FIXED VERSION"""
-        V = len(vocab)
+        # Normalize to [0, 1]
+        max_cooccur = torch.max(word_cooccur)
+        if max_cooccur > 0:
+            word_cooccur = word_cooccur / max_cooccur
         
-        # Calculate word frequencies from original data
-        if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
-            word_counts = np.sum(train_data, axis=0)
-        else:
-            word_counts = np.zeros(V)
-            for doc in train_data:
-                unique_words, counts = np.unique(doc, return_counts=True)
-                valid_mask = unique_words < V
-                word_counts[unique_words[valid_mask]] += counts[valid_mask]
-        
-        total_count = np.sum(word_counts)
-        word_probs = word_counts / (total_count + 1e-8)
-        
-        # Ensure minimum probability
-        word_probs = np.maximum(word_probs, 1e-8)
-        
-        # PMI computation with proper normalization
-        cooc_total = np.sum(cooc_matrix)
-        if cooc_total > 0:
-            joint_probs = cooc_matrix / cooc_total
-        else:
-            joint_probs = cooc_matrix + 1e-8
-        
-        # Vectorized PMI calculation
-        word_probs_i = word_probs[:, np.newaxis]  # [V, 1]
-        word_probs_j = word_probs[np.newaxis, :]  # [1, V]
-        expected_joint = word_probs_i * word_probs_j  # [V, V]
-        
-        # PMI = log(P(i,j) / (P(i) * P(j)))
-        pmi_matrix = np.log((joint_probs + 1e-8) / (expected_joint + 1e-8))
-        
-        # Clip negative PMI values and normalize to [0,1]
-        pmi_matrix = np.maximum(pmi_matrix, 0)
-        if np.max(pmi_matrix) > 0:
-            pmi_matrix = pmi_matrix / np.max(pmi_matrix)
-        
-        return pmi_matrix
+        self.word_cooccur_cache = word_cooccur
+        logging.info(f"Word co-occurrence cache built: {torch.count_nonzero(word_cooccur)} non-zero entries")
 
     def get_beta(self):
+        """Get topic-word distribution beta"""
         dist = self.pairwise_euclidean_distance(
             self.topic_embeddings, self.word_embeddings)
         beta = F.softmax(-dist / self.beta_temp, dim=0)
         return beta
 
-    def get_loss_multi_scale_coherence(self):
+    def get_loss_topic_separation(self):
         """
-        FIXED Multi-scale coherence loss - Ensure it actually works
+        Topic Separation Loss - Forces topics to be well-separated in embedding space
+        
+        Formula: L_sep = -log(min_distance) + log(mean_distance)
+        
+        This improves Purity/NMI by ensuring topics are distinguishable
         """
-        if self.weight_loss_coherence <= 1e-8 or not self.cooc_matrices:
+        if self.weight_loss_topic_separation <= 1e-8:
             return torch.tensor(0.0, device=self.topic_embeddings.device)
-            
-        beta = self.get_beta()  # [num_topics, vocab_size] - KEEP GRADIENTS!
-        total_coherence_loss = 0.0
-        num_valid_windows = 0
         
-        # Use ALL window sizes, not just primary one
-        for window_size in self.coherence_window_sizes:
-            if window_size not in self.cooc_matrices:
-                continue
-                
-            X = self.cooc_matrices[window_size].to(self.topic_embeddings.device)
-            
-            # Get top-k words for each topic
-            top_k_values, top_k_indices = torch.topk(beta, k=self.coherence_top_k, dim=1)  # [num_topics, k]
-            
-            coherence_loss_window = 0.0
-            num_valid_topics = 0
-            
-            for topic_idx in range(self.num_topics):
-                topic_words = top_k_indices[topic_idx]  # [k]
-                topic_probs = top_k_values[topic_idx]  # [k] - WITH GRADIENTS
-                
-                # Normalize probabilities to sum to 1
-                topic_probs = F.softmax(topic_probs, dim=0)
-                
-                # Get co-occurrence submatrix for this topic's words
-                cooc_submatrix = X[topic_words][:, topic_words]  # [k, k]
-                
-                # Compute pairwise coherence using PMI-style calculation
-                coherence_topic = 0.0
-                valid_pairs = 0
-                
-                for i in range(self.coherence_top_k):
-                    for j in range(i+1, self.coherence_top_k):  # Only upper triangle
-                        cooc_val = cooc_submatrix[i, j]
-                        if cooc_val > 1e-6:  # Only consider non-zero co-occurrences
-                            # PMI-style coherence: log(P(w_i, w_j) / (P(w_i) * P(w_j)))
-                            joint_prob = cooc_val  # Already normalized in build phase
-                            marginal_i = topic_probs[i]
-                            marginal_j = topic_probs[j]
-                            
-                            if marginal_i > 1e-8 and marginal_j > 1e-8:
-                                pmi_score = torch.log(joint_prob + 1e-8) - torch.log(marginal_i + 1e-8) - torch.log(marginal_j + 1e-8)
-                                coherence_topic += pmi_score
-                                valid_pairs += 1
-                
-                if valid_pairs > 0:
-                    coherence_loss_window += coherence_topic / valid_pairs
-                    num_valid_topics += 1
-            
-            if num_valid_topics > 0:
-                total_coherence_loss += coherence_loss_window / num_valid_topics
-                num_valid_windows += 1
+        # Compute pairwise distances between topic embeddings
+        topic_distances = torch.cdist(self.topic_embeddings, self.topic_embeddings, p=2)
         
-        if num_valid_windows > 0:
-            final_loss = total_coherence_loss / num_valid_windows
-            # Return NEGATIVE loss (we want to MAXIMIZE coherence)
-            return -self.weight_loss_coherence * final_loss
-        else:
+        # Mask out diagonal (self-distances)
+        mask = torch.eye(self.num_topics, device=self.topic_embeddings.device).bool()
+        topic_distances = topic_distances.masked_fill(mask, float('inf'))
+        
+        # Separation loss: encourage minimum distance to be large
+        min_distance = torch.min(topic_distances)
+        mean_distance = torch.mean(topic_distances[~mask])
+        
+        # Loss: minimize negative log of minimum distance + maximize mean distance
+        separation_loss = -torch.log(min_distance + 1e-8) + torch.log(mean_distance + 1e-8)
+        
+        return self.weight_loss_topic_separation * separation_loss
+
+    def get_loss_semantic_coherence(self):
+        """
+        Semantic Coherence Loss - Uses word embeddings similarity and co-occurrence
+        
+        Formula: L_coherence = -sum(similarity * cooccurrence) for top-k words per topic
+        
+        This improves CV by ensuring semantically similar words are grouped together
+        """
+        if self.weight_loss_semantic_coherence <= 1e-8 or self.word_cooccur_cache is None:
             return torch.tensor(0.0, device=self.topic_embeddings.device)
+        
+        beta = self.get_beta()  # [num_topics, vocab_size]
+        
+        # Move cache to device
+        cooccur_cache = self.word_cooccur_cache.to(self.topic_embeddings.device)
+        
+        total_coherence = 0.0
+        
+        # For each topic, compute semantic coherence of top-k words
+        for topic_idx in range(self.num_topics):
+            # Get top-k words for this topic
+            top_k_values, top_k_indices = torch.topk(beta[topic_idx], k=self.coherence_top_k)
+            
+            # Compute pairwise semantic similarity using word embeddings
+            top_k_embeddings = self.word_embeddings[top_k_indices]  # [k, embed_size]
+            similarity_matrix = F.cosine_similarity(
+                top_k_embeddings.unsqueeze(1), 
+                top_k_embeddings.unsqueeze(0), 
+                dim=2
+            )  # [k, k]
+            
+            # Get co-occurrence matrix for top-k words
+            cooccur_matrix = cooccur_cache[top_k_indices][:, top_k_indices]  # [k, k]
+            
+            # Semantic coherence: similarity weighted by co-occurrence
+            # Only consider upper triangle to avoid double counting
+            mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
+            
+            coherence_score = torch.sum(similarity_matrix[mask] * cooccur_matrix[mask])
+            total_coherence += coherence_score
+        
+        # Normalize by number of topics and return negative (we want to maximize coherence)
+        coherence_loss = total_coherence / self.num_topics
+        
+        return -self.weight_loss_semantic_coherence * coherence_loss
+
 
     def create_group_topic(self):
         with torch.no_grad():  
@@ -515,20 +445,23 @@ class HiCOT_Enhanced(nn.Module):
         loss_CLC = 0.0
         loss_CLT = 0.0
 
-        if epoch_id >= self.threshold_epoch and (epoch_id == self.threshold_epoch or (epoch_id > self.threshold_epoch and epoch_id % self.threshold_cluster == 0)):
-            self.create_group_topic()
+        if epoch_id is not None and epoch_id >= self.threshold_epoch:
+            if epoch_id == self.threshold_epoch or (epoch_id > self.threshold_epoch and epoch_id % self.threshold_cluster == 0):
+                self.create_group_topic()
 
-        if epoch_id >= self.threshold_epoch and self.weight_loss_CLC != 0:
-            loss_CLC = self.get_loss_CLC()
-        
-        if epoch_id >= self.threshold_epoch and self.weight_loss_CLT != 0:
-            loss_CLT = self.get_loss_CLT()
+            if self.weight_loss_CLC > 1e-8:
+                loss_CLC = self.get_loss_CLC()
             
-        # ONLY Multi-Scale Coherence Loss - The main innovation
-        loss_multi_scale_coherence = self.get_loss_multi_scale_coherence()
+            if self.weight_loss_CLT > 1e-8:
+                loss_CLT = self.get_loss_CLT()
 
-        # Updated total loss with only the multi-scale coherence
-        loss = loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_multi_scale_coherence
+        # NEW Enhanced losses - Apply throughout training
+        loss_topic_separation = self.get_loss_topic_separation()
+        loss_semantic_coherence = self.get_loss_semantic_coherence()
+
+        # Total loss with enhanced components
+        loss = (loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + 
+                loss_topic_separation + loss_semantic_coherence)
                
         rst_dict = {
             'loss': loss,
@@ -538,7 +471,8 @@ class HiCOT_Enhanced(nn.Module):
             'loss_TP': loss_TP,
             'loss_CLC': loss_CLC,
             'loss_CLT': loss_CLT,
-            'loss_multi_scale_coherence': loss_multi_scale_coherence
+            'loss_topic_separation': loss_topic_separation,
+            'loss_semantic_coherence': loss_semantic_coherence
         }
 
         return rst_dict

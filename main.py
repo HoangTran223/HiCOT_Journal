@@ -39,11 +39,20 @@ if __name__ == "__main__":
     config.add_model_argument(parser)
     config.add_training_argument(parser)
     config.add_eval_argument(parser)
-    # Enhanced coherence parameters - CHỈ GIỮ LẠI MULTI-SCALE COHERENCE
+    
+    # Enhanced coherence parameters for HiCOT_Enhanced
+    parser.add_argument('--weight_loss_topic_separation', type=float, default=2.0, 
+                       help='Weight for topic separation loss')
+    parser.add_argument('--weight_loss_semantic_coherence', type=float, default=1.0, 
+                       help='Weight for semantic coherence loss')
+    parser.add_argument('--coherence_top_k', type=int, default=15, 
+                       help='Top-k words for coherence computation')
+    
+    # For HiCOT_C
     parser.add_argument('--weight_loss_coherence', type=float, default=1.0)
-    parser.add_argument('--coherence_window_sizes', nargs='+', type=int, default=[2, 5, 10])
-    parser.add_argument('--coherence_norm', type=str, default='pmi')
-    parser.add_argument('--coherence_top_k', type=int, default=15)
+    parser.add_argument('--cooc_norm', type=str, default='log', choices=['log', 'max', 'sqrt'])
+    parser.add_argument('--cooc_window_size', type=int, default=5)
+    
     args = parser.parse_args()
 
     current_time = miscellaneous.get_current_datetime()
@@ -127,7 +136,7 @@ if __name__ == "__main__":
             # Thêm các tham số cho loss_coherence
             weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
             cooc_norm=getattr(args, 'cooc_norm', 'log'),
-            cooc_window_size=getattr(args, 'cooc_window_size', 5),  # Add window size parameter
+            cooc_window_size=getattr(args, 'cooc_window_size', 5),
             train_data=dataset.train_bow,
         )
         model = model.to(args.device)
@@ -141,11 +150,11 @@ if __name__ == "__main__":
             print(f"Initial coherence loss: {test_loss}")
 
     elif args.model == "HiCOT_Enhanced":
-        # Validate coherence parameters
-        print(f"Coherence parameters:")
-        print(f"  weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
-        print(f"  coherence_window_sizes: {getattr(args, 'coherence_window_sizes', [2, 5, 10])}")
-        print(f"  coherence_norm: {getattr(args, 'coherence_norm', 'pmi')}")
+        # Validate enhanced parameters
+        print(f"HiCOT_Enhanced parameters:")
+        print(f"  weight_loss_topic_separation: {getattr(args, 'weight_loss_topic_separation', 2.0)}")
+        print(f"  weight_loss_semantic_coherence: {getattr(args, 'weight_loss_semantic_coherence', 1.0)}")
+        print(f"  weight_loss_entropy_reg: {getattr(args, 'weight_loss_entropy_reg', 0.5)}")
         print(f"  coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
         
         model = HiCOT_Enhanced(
@@ -170,10 +179,10 @@ if __name__ == "__main__":
             doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
             method_CL=args.method_CL,
             metric_CL=args.metric_CL,
-            # CHỈ GIỮ LẠI Multi-Scale Coherence parameters
-            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
-            coherence_window_sizes=getattr(args, 'coherence_window_sizes', [2, 5, 10]),
-            coherence_norm=getattr(args, 'coherence_norm', 'pmi'),
+            # Enhanced parameters
+            weight_loss_topic_separation=getattr(args, 'weight_loss_topic_separation', 2.0),
+            weight_loss_semantic_coherence=getattr(args, 'weight_loss_semantic_coherence', 1.0),
+            weight_loss_entropy_reg=getattr(args, 'weight_loss_entropy_reg', 0.5),
             coherence_top_k=getattr(args, 'coherence_top_k', 15),
             train_data=dataset.train_bow,
         )
@@ -181,11 +190,15 @@ if __name__ == "__main__":
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
         
-        # Test coherence loss immediately after model creation
-        print("Testing coherence loss computation...")
+        # Test enhanced losses immediately after model creation
+        print("Testing HiCOT_Enhanced loss computation...")
         with torch.no_grad():
-            test_loss = model.get_loss_multi_scale_coherence()
-            print(f"Initial coherence loss: {test_loss}")
+            test_sep_loss = model.get_loss_topic_separation()
+            test_coh_loss = model.get_loss_semantic_coherence()
+            test_ent_loss = model.get_loss_entropy_regularization()
+            print(f"Initial topic separation loss: {test_sep_loss}")
+            print(f"Initial semantic coherence loss: {test_coh_loss}")
+            print(f"Initial entropy regularization loss: {test_ent_loss}")
 
     else:
         print(f"Wrong model")
