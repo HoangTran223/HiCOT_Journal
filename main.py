@@ -152,9 +152,7 @@ if __name__ == "__main__":
     elif args.model == "HiCOT_Enhanced":
         # Validate enhanced parameters
         print(f"HiCOT_Enhanced parameters:")
-        print(f"--weight_loss_topic_separation: {getattr(args, 'weight_loss_topic_separation', 2.0)}")
-        print(f"--weight_loss_semantic_coherence: {getattr(args, 'weight_loss_semantic_coherence', 1.0)}")
-        print(f"--weight_loss_entropy_reg: {getattr(args, 'weight_loss_entropy_reg', 0.5)}")
+        print(f"--weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
         print(f"--coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
         
         model = HiCOT_Enhanced(
@@ -179,9 +177,8 @@ if __name__ == "__main__":
             doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
             method_CL=args.method_CL,
             metric_CL=args.metric_CL,
-            # Enhanced parameters
-            weight_loss_topic_separation=getattr(args, 'weight_loss_topic_separation', 2.0),
-            weight_loss_semantic_coherence=getattr(args, 'weight_loss_semantic_coherence', 1.0),
+            # Only pass the correct coherence params
+            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
             coherence_top_k=getattr(args, 'coherence_top_k', 15),
             train_data=dataset.train_bow,
         )
@@ -189,13 +186,11 @@ if __name__ == "__main__":
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
         
-        # Test enhanced losses immediately after model creation
-        print("Testing HiCOT_Enhanced loss computation...")
+        # Test coherence loss immediately after model creation
+        print("Testing HiCOT_Enhanced coherence loss computation...")
         with torch.no_grad():
-            test_sep_loss = model.get_loss_topic_separation()
-            test_coh_loss = model.get_loss_semantic_coherence()
-            print(f"Initial topic separation loss: {test_sep_loss}")
-            print(f"Initial semantic coherence loss: {test_coh_loss}")
+            test_coh_loss = model.get_loss_coherence_npmi()
+            print(f"Initial coherence loss: {test_coh_loss}")
 
     else:
         print(f"Wrong model")

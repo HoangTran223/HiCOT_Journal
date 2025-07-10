@@ -17,11 +17,7 @@ import os
 
 class HiCOT_Enhanced(nn.Module):
     """
-    Enhanced HiCOT with Topic Separation Loss and Semantic Coherence Loss
-    
-    KEY INNOVATIONS:
-    1. Topic Separation Loss - Forces topics to be well-separated (improves Purity/NMI)
-    2. Semantic Coherence Loss - Uses word embeddings similarity (improves CV)
+    HiCOT_Enhanced: Giữ lại các loss gốc của HiCOT, bổ sung thêm loss coherence kiểu NPMI dựa trên co-occurrence thực tế để tăng CV.
     """
     def __init__(self, vocab_size, data_name='20NG', num_topics=50, en_units=200, dropout=0.,
                 threshold_epoch=10, doc2vec_size=384, pretrained_WE=None, embed_size=200, beta_temp=0.2, 
@@ -29,12 +25,8 @@ class HiCOT_Enhanced(nn.Module):
                 weight_loss_TP=250.0, alpha_TP=20.0, alpha_DT=3.0, weight_loss_DT=10.0, 
                 vocab=None, doc_embeddings=None, weight_loss_CLC=1.0, max_clusters=50, 
                 method_CL='HAC', metric_CL='euclidean', sinkhorn_max_iter=5000,
-                # NEW Enhanced parameters
-                weight_loss_topic_separation=2.0, weight_loss_semantic_coherence=1.0, 
-                weight_loss_entropy_reg=0.5, coherence_top_k=15, train_data=None):
-
+                weight_loss_coherence=1.0, coherence_top_k=15, train_data=None):
         super().__init__()
-
         self.method_CL = method_CL
         self.metric_CL = metric_CL
         self.threshold_epoch = threshold_epoch
@@ -43,187 +35,111 @@ class HiCOT_Enhanced(nn.Module):
         self.beta_temp = beta_temp
         self.data_name = data_name
         self.vocab_size = vocab_size
-
-        # Standard neural topic model parameters
         self.a = 1 * np.ones((1, num_topics)).astype(np.float32)
-        self.mu2 = nn.Parameter(torch.as_tensor(
-            (np.log(self.a).T - np.mean(np.log(self.a), 1)).T))
-        self.var2 = nn.Parameter(torch.as_tensor(
-            (((1.0 / self.a) * (1 - (2.0 / num_topics))).T + (1.0 / (num_topics * num_topics)) * np.sum(1.0 / self.a, 1)).T))
-
+        self.mu2 = nn.Parameter(torch.as_tensor((np.log(self.a).T - np.mean(np.log(self.a), 1)).T))
+        self.var2 = nn.Parameter(torch.as_tensor((((1.0 / self.a) * (1 - (2.0 / num_topics))).T + (1.0 / (num_topics * num_topics)) * np.sum(1.0 / self.a, 1)).T))
         self.mu2.requires_grad = False
         self.var2.requires_grad = False
-
-        # Neural network layers
         self.fc11 = nn.Linear(vocab_size, en_units)
         self.fc12 = nn.Linear(en_units, en_units)
         self.fc21 = nn.Linear(en_units, num_topics)
         self.fc22 = nn.Linear(en_units, num_topics)
         self.fc1_dropout = nn.Dropout(dropout)
-
         self.mean_bn = nn.BatchNorm1d(num_topics)
         self.mean_bn.weight.requires_grad = False
         self.logvar_bn = nn.BatchNorm1d(num_topics)
         self.logvar_bn.weight.requires_grad = False
         self.decoder_bn = nn.BatchNorm1d(vocab_size, affine=True)
         self.decoder_bn.weight.requires_grad = False
-
-        # Word and topic embeddings
         if pretrained_WE is not None:
             self.word_embeddings = torch.from_numpy(pretrained_WE).float()
         else:
-            self.word_embeddings = nn.init.trunc_normal_(
-                torch.empty(vocab_size, embed_size))
-
+            self.word_embeddings = nn.init.trunc_normal_(torch.empty(vocab_size, embed_size))
         self.word_embeddings = nn.Parameter(F.normalize(self.word_embeddings))
         self.topic_embeddings = torch.empty((num_topics, self.word_embeddings.shape[1]))
         nn.init.trunc_normal_(self.topic_embeddings, std=0.1)
         self.topic_embeddings = nn.Parameter(F.normalize(self.topic_embeddings))
-
-        # Loss components
         self.ECR = ECR(weight_loss_ECR, alpha_ECR, sinkhorn_max_iter)
         self.weight_loss_CLT = weight_loss_CLT
         self.weight_loss_CLC = weight_loss_CLC
         self.DT = DT(weight_loss_DT, alpha_TP)
         self.TP = TP(weight_loss_TP, alpha_TP)
-
-        # Additional attributes
         self.max_clusters = max_clusters
         self.vocab = vocab
         self.matrixP = None
         self.doc_embeddings = doc_embeddings.to(self.topic_embeddings.device) if doc_embeddings is not None else None
         self.group_topic = None
-
         self.document_emb_prj = nn.Sequential(
             nn.Linear(doc2vec_size, embed_size), 
             nn.ReLU(),
             nn.Dropout(dropout)
         ).to(self.topic_embeddings.device)
-
         self.topics = []
         self.topic_index_mapping = {}
-
-        # NEW Enhanced parameters
-        self.weight_loss_topic_separation = weight_loss_topic_separation
-        self.weight_loss_semantic_coherence = weight_loss_semantic_coherence
-        self.weight_loss_entropy_reg = weight_loss_entropy_reg
+        self.weight_loss_coherence = weight_loss_coherence
         self.coherence_top_k = coherence_top_k
-        
-        # Cache word co-occurrence statistics from data for semantic coherence
+        # Build co-occurrence cache for NPMI
         self.word_cooccur_cache = None
+        self.word_count = None
+        self.total_docs = None
         if train_data is not None and vocab is not None:
             self._build_word_cooccur_cache(train_data, vocab)
 
     def _build_word_cooccur_cache(self, train_data, vocab):
-        """Build word co-occurrence cache for semantic coherence computation"""
         V = len(vocab)
         word_cooccur = torch.zeros((V, V), dtype=torch.float32)
-        
-        logging.info("Building word co-occurrence cache...")
-        
-        if isinstance(train_data, np.ndarray) and train_data.ndim == 2:
-            # Document-level co-occurrence for semantic coherence
-            for doc_idx, doc in enumerate(train_data):
-                if doc_idx % 1000 == 0:
-                    print(f"Processing doc {doc_idx}/{len(train_data)}")
-                
-                words = np.where(doc > 0)[0]  # Words present in document
-                if len(words) > 1:
-                    # All pairs of words in document co-occur
-                    for i in range(len(words)):
-                        for j in range(i+1, len(words)):
-                            if words[i] < V and words[j] < V:
-                                word_cooccur[words[i], words[j]] += 1
-                                word_cooccur[words[j], words[i]] += 1
-        
-        # Normalize to [0, 1]
-        max_cooccur = torch.max(word_cooccur)
-        if max_cooccur > 0:
-            word_cooccur = word_cooccur / max_cooccur
-        
+        word_count = torch.zeros(V, dtype=torch.float32)
+        total_docs = 0
+        for doc in train_data:
+            words = np.where(doc > 0)[0]
+            for i in range(len(words)):
+                word_count[words[i]] += 1
+                for j in range(i+1, len(words)):
+                    word_cooccur[words[i], words[j]] += 1
+                    word_cooccur[words[j], words[i]] += 1
+            total_docs += 1
         self.word_cooccur_cache = word_cooccur
-        logging.info(f"Word co-occurrence cache built: {torch.count_nonzero(word_cooccur)} non-zero entries")
+        self.word_count = word_count
+        self.total_docs = total_docs
 
     def get_beta(self):
-        """Get topic-word distribution beta"""
-        dist = self.pairwise_euclidean_distance(
-            self.topic_embeddings, self.word_embeddings)
+        dist = self.pairwise_euclidean_distance(self.topic_embeddings, self.word_embeddings)
         beta = F.softmax(-dist / self.beta_temp, dim=0)
         return beta
 
-    def get_loss_topic_separation(self):
-        """
-        Topic Separation Loss - Forces topics to be well-separated in embedding space
-        
-        Formula: L_sep = -log(min_distance) + log(mean_distance)
-        
-        This improves Purity/NMI by ensuring topics are distinguishable
-        """
-        if self.weight_loss_topic_separation <= 1e-8:
+    def get_loss_coherence_npmi(self):
+        if self.weight_loss_coherence <= 1e-8 or self.word_cooccur_cache is None:
             return torch.tensor(0.0, device=self.topic_embeddings.device)
-        
-        # Compute pairwise distances between topic embeddings
-        topic_distances = torch.cdist(self.topic_embeddings, self.topic_embeddings, p=2)
-        
-        # Mask out diagonal (self-distances)
-        mask = torch.eye(self.num_topics, device=self.topic_embeddings.device).bool()
-        topic_distances = topic_distances.masked_fill(mask, float('inf'))
-        
-        # Separation loss: encourage minimum distance to be large
-        min_distance = torch.min(topic_distances)
-        mean_distance = torch.mean(topic_distances[~mask])
-        
-        # Loss: minimize negative log of minimum distance + maximize mean distance
-        separation_loss = -torch.log(min_distance + 1e-8) + torch.log(mean_distance + 1e-8)
-        
-        return self.weight_loss_topic_separation * separation_loss
-
-    def get_loss_semantic_coherence(self):
-        """
-        Semantic Coherence Loss - Uses word embeddings similarity and co-occurrence
-        
-        Formula: L_coherence = -sum(similarity * cooccurrence) for top-k words per topic
-        
-        This improves CV by ensuring semantically similar words are grouped together
-        """
-        if self.weight_loss_semantic_coherence <= 1e-8 or self.word_cooccur_cache is None:
-            return torch.tensor(0.0, device=self.topic_embeddings.device)
-        
-        beta = self.get_beta()  # [num_topics, vocab_size]
-        
-        # Move cache to device
-        cooccur_cache = self.word_cooccur_cache.to(self.topic_embeddings.device)
-        
-        total_coherence = 0.0
-        
-        # For each topic, compute semantic coherence of top-k words
+        beta = self.get_beta()
+        eps = 1e-8
+        total_npmi = 0.0
+        # Dùng numpy cho co-occurrence và word_count để thao tác nhanh hơn
+        word_cooccur = self.word_cooccur_cache.cpu().numpy()
+        word_count = self.word_count.cpu().numpy()
+        total_docs = float(self.total_docs)
         for topic_idx in range(self.num_topics):
-            # Get top-k words for this topic
             top_k_values, top_k_indices = torch.topk(beta[topic_idx], k=self.coherence_top_k)
-            
-            # Compute pairwise semantic similarity using word embeddings
-            top_k_embeddings = self.word_embeddings[top_k_indices]  # [k, embed_size]
-            similarity_matrix = F.cosine_similarity(
-                top_k_embeddings.unsqueeze(1), 
-                top_k_embeddings.unsqueeze(0), 
-                dim=2
-            )  # [k, k]
-            
-            # Get co-occurrence matrix for top-k words
-            cooccur_matrix = cooccur_cache[top_k_indices][:, top_k_indices]  # [k, k]
-            
-            # Semantic coherence: similarity weighted by co-occurrence
-            # Only consider upper triangle to avoid double counting
-            mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
-            
-            coherence_score = torch.sum(similarity_matrix[mask] * cooccur_matrix[mask])
-            total_coherence += coherence_score
-        
-        # Normalize by number of topics and return negative (we want to maximize coherence)
-        coherence_loss = total_coherence / self.num_topics
-        
-        return -self.weight_loss_semantic_coherence * coherence_loss
-
+            idx = top_k_indices.cpu().numpy()
+            npmi_sum = 0.0
+            count = 0
+            for i in range(self.coherence_top_k):
+                for j in range(i+1, self.coherence_top_k):
+                    w_i = idx[i]
+                    w_j = idx[j]
+                    cooccur = word_cooccur[w_i, w_j]
+                    if cooccur < 1:
+                        continue
+                    p_ij = cooccur / total_docs
+                    p_i = word_count[w_i] / total_docs
+                    p_j = word_count[w_j] / total_docs
+                    pmi = np.log(p_ij / (p_i * p_j) + eps)
+                    npmi = pmi / (-np.log(p_ij + eps))
+                    npmi_sum += npmi
+                    count += 1
+            if count > 0:
+                total_npmi += npmi_sum / count
+        coherence_loss = total_npmi / self.num_topics
+        return -self.weight_loss_coherence * torch.tensor(coherence_loss, device=self.topic_embeddings.device, dtype=torch.float32)
 
     def create_group_topic(self):
         with torch.no_grad():  
@@ -455,13 +371,10 @@ class HiCOT_Enhanced(nn.Module):
             if self.weight_loss_CLT > 1e-8:
                 loss_CLT = self.get_loss_CLT()
 
-        # NEW Enhanced losses - Apply throughout training
-        loss_topic_separation = self.get_loss_topic_separation()
-        loss_semantic_coherence = self.get_loss_semantic_coherence()
+        # Thêm loss coherence kiểu NPMI
+        loss_coherence = self.get_loss_coherence_npmi()
 
-        # Total loss with enhanced components
-        loss = (loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + 
-                loss_topic_separation + loss_semantic_coherence)
+        loss = (loss_TM + loss_ECR + loss_TP + loss_DT + loss_CLC + loss_CLT + loss_coherence)
                
         rst_dict = {
             'loss': loss,
@@ -471,8 +384,7 @@ class HiCOT_Enhanced(nn.Module):
             'loss_TP': loss_TP,
             'loss_CLC': loss_CLC,
             'loss_CLT': loss_CLT,
-            'loss_topic_separation': loss_topic_separation,
-            'loss_semantic_coherence': loss_semantic_coherence
+            'loss_coherence': loss_coherence
         }
 
         return rst_dict
