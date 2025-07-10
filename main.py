@@ -152,10 +152,10 @@ if __name__ == "__main__":
     elif args.model == "HiCOT_Enhanced":
         # Validate enhanced parameters
         print(f"HiCOT_Enhanced parameters:")
-        print(f"  weight_loss_topic_separation: {getattr(args, 'weight_loss_topic_separation', 2.0)}")
-        print(f"  weight_loss_semantic_coherence: {getattr(args, 'weight_loss_semantic_coherence', 1.0)}")
-        print(f"  weight_loss_entropy_reg: {getattr(args, 'weight_loss_entropy_reg', 0.5)}")
-        print(f"  coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
+        print(f"--weight_loss_topic_separation: {getattr(args, 'weight_loss_topic_separation', 2.0)}")
+        print(f"--weight_loss_semantic_coherence: {getattr(args, 'weight_loss_semantic_coherence', 1.0)}")
+        print(f"--weight_loss_entropy_reg: {getattr(args, 'weight_loss_entropy_reg', 0.5)}")
+        print(f"--coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
         
         model = HiCOT_Enhanced(
             vocab_size=dataset.vocab_size,
@@ -182,7 +182,6 @@ if __name__ == "__main__":
             # Enhanced parameters
             weight_loss_topic_separation=getattr(args, 'weight_loss_topic_separation', 2.0),
             weight_loss_semantic_coherence=getattr(args, 'weight_loss_semantic_coherence', 1.0),
-            weight_loss_entropy_reg=getattr(args, 'weight_loss_entropy_reg', 0.5),
             coherence_top_k=getattr(args, 'coherence_top_k', 15),
             train_data=dataset.train_bow,
         )
@@ -195,10 +194,8 @@ if __name__ == "__main__":
         with torch.no_grad():
             test_sep_loss = model.get_loss_topic_separation()
             test_coh_loss = model.get_loss_semantic_coherence()
-            test_ent_loss = model.get_loss_entropy_regularization()
             print(f"Initial topic separation loss: {test_sep_loss}")
             print(f"Initial semantic coherence loss: {test_coh_loss}")
-            print(f"Initial entropy regularization loss: {test_ent_loss}")
 
     else:
         print(f"Wrong model")
