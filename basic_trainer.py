@@ -48,7 +48,7 @@ class BasicTrainer:
         self.train(dataset_handler, verbose)
         top_words = self.export_top_words(dataset_handler.vocab, num_top_words)
     
-        if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced':
+        if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced' or self.model_name == 'HiCOT_Plus':
             train_theta = self.test(dataset_handler.train_data, dataset_handler.doc_embeddings)
         else:
             print(f"Wrong model")
@@ -70,7 +70,7 @@ class BasicTrainer:
             loss_rst_dict = defaultdict(float)
 
             for batch_id, batch in enumerate(dataset_handler.train_dataloader): 
-                if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced':
+                if self.model_name == 'HiCOT' or self.model_name == 'HiCOT_C' or self.model_name == 'HiCOT_Enhanced' or self.model_name == 'HiCOT_Plus':
                     *inputs, indices, doc_embeddings = batch
                 else:
                     print(f"Wrong model")

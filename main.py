@@ -4,6 +4,7 @@ import numpy as np
 import basic_trainer
 from HiCOT.HiCOT import HiCOT
 from HiCOT.HiCOT_C import HiCOT_C
+from HiCOT.HiCOT_Plus import HiCOT_Plus
 from HiCOT.HiCOT_Enhanced import HiCOT_Enhanced
 import evaluations
 import datasethandler
@@ -53,6 +54,9 @@ if __name__ == "__main__":
     parser.add_argument('--cooc_norm', type=str, default='log', choices=['log', 'max', 'sqrt'])
     parser.add_argument('--cooc_window_size', type=int, default=5)
     
+    # For HiCOT_Plus
+    parser.add_argument('--weight_loss_DTC', type=float, default=1.0, help='Weight for Document-Topic Contrastive loss')
+
     args = parser.parse_args()
 
     current_time = miscellaneous.get_current_datetime()
@@ -105,6 +109,38 @@ if __name__ == "__main__":
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
 
+    elif args.model == "HiCOT_Plus":
+        print(f"HiCOT_Plus parameters:")
+        print(f"--weight_loss_DTC: {args.weight_loss_DTC}")
+        model = HiCOT_Plus(
+            vocab_size=dataset.vocab_size,
+            data_name=args.dataset,
+            num_topics=args.num_topics,
+            dropout=args.dropout,
+            pretrained_WE=pretrainWE if args.use_pretrainWE else None,
+            weight_loss_ECR=args.weight_ECR,
+            alpha_ECR=args.alpha_ECR,
+            weight_loss_TP=args.weight_loss_TP,
+            weight_loss_DT=args.weight_loss_DT,
+            alpha_TP=args.alpha_TP,
+            alpha_DT=args.alpha_DT,
+            beta_temp=args.beta_temp,
+            vocab=dataset.vocab,
+            weight_loss_CLC=args.weight_loss_CLC,
+            max_clusters=args.max_clusters,
+            weight_loss_CLT=args.weight_loss_CLT,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
+            method_CL=args.method_CL,
+            metric_CL=args.metric_CL,
+            # New parameter for HiCOT_Plus
+            weight_loss_DTC=args.weight_loss_DTC
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
     elif args.model == "HiCOT_C":
         # Validate coherence parameters
         print(f"HiCOT_C Coherence parameters:")
@@ -149,52 +185,8 @@ if __name__ == "__main__":
             test_loss = model.get_loss_coherence()
             print(f"Initial coherence loss: {test_loss}")
 
-    elif args.model == "HiCOT_Enhanced":
-        # Validate enhanced parameters
-        print(f"HiCOT_Enhanced parameters:")
-        print(f"--weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
-        print(f"--coherence_top_k: {getattr(args, 'coherence_top_k', 15)}")
-        
-        model = HiCOT_Enhanced(
-            vocab_size=dataset.vocab_size,
-            data_name=args.dataset,
-            num_topics=args.num_topics,
-            dropout=args.dropout,
-            pretrained_WE=pretrainWE if args.use_pretrainWE else None,
-            weight_loss_ECR=args.weight_ECR,
-            alpha_ECR=args.alpha_ECR,
-            weight_loss_TP=args.weight_loss_TP,
-            weight_loss_DT=args.weight_loss_DT,
-            alpha_TP=args.alpha_TP,
-            alpha_DT=args.alpha_DT,
-            beta_temp=args.beta_temp,
-            vocab=dataset.vocab,
-            weight_loss_CLC=args.weight_loss_CLC,
-            max_clusters=args.max_clusters,
-            weight_loss_CLT=args.weight_loss_CLT,
-            threshold_epoch=args.threshold_epoch,
-            threshold_cluster=args.threshold_cluster,
-            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
-            method_CL=args.method_CL,
-            metric_CL=args.metric_CL,
-            # Only pass the correct coherence params
-            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
-            coherence_top_k=getattr(args, 'coherence_top_k', 15),
-            train_data=dataset.train_bow,
-        )
-        model = model.to(args.device)
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Number of trainable parameters: {trainable_params}")
-        
-        # Test coherence loss immediately after model creation
-        print("Testing HiCOT_Enhanced coherence loss computation...")
-        with torch.no_grad():
-            test_coh_loss = model.get_loss_coherence_npmi()
-            print(f"Initial coherence loss: {test_coh_loss}")
-
     else:
         print(f"Wrong model")
-
 
     # Create a trainer
     trainer = basic_trainer.BasicTrainer(model, model_name=args.model,
