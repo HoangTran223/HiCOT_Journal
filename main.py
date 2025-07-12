@@ -5,7 +5,6 @@ import basic_trainer
 from HiCOT.HiCOT import HiCOT
 from HiCOT.HiCOT_C import HiCOT_C
 from HiCOT.HiCOT_Plus import HiCOT_Plus
-from HiCOT.HiCOT_Enhanced import HiCOT_Enhanced
 import evaluations
 import datasethandler
 import scipy
@@ -40,14 +39,6 @@ if __name__ == "__main__":
     config.add_model_argument(parser)
     config.add_training_argument(parser)
     config.add_eval_argument(parser)
-    
-    # Enhanced coherence parameters for HiCOT_Enhanced
-    parser.add_argument('--weight_loss_topic_separation', type=float, default=2.0, 
-                       help='Weight for topic separation loss')
-    parser.add_argument('--weight_loss_semantic_coherence', type=float, default=1.0, 
-                       help='Weight for semantic coherence loss')
-    parser.add_argument('--coherence_top_k', type=int, default=15, 
-                       help='Top-k words for coherence computation')
     
     # For HiCOT_C
     parser.add_argument('--weight_loss_coherence', type=float, default=1.0)
