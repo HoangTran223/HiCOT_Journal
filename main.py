@@ -5,6 +5,13 @@ import basic_trainer
 from HiCOT.HiCOT import HiCOT
 from HiCOT.HiCOT_C import HiCOT_C
 from HiCOT.HiCOT_Plus import HiCOT_Plus
+from ETM.ETM_Plus import ETM_Plus
+from FASTopic.FASTopic_Plus import FASTopic_Plus
+from FASTopic.FASTopic import FASTopic
+from ETM.ETM import ETM
+from NeuroMax.NeuroMax_Plus import NeuroMax_Plus
+from CTM.CombinedTM_Plus import CombinedTM_Plus
+from CTM.CombinedTM import CombinedTM
 import evaluations
 import datasethandler
 import scipy
@@ -32,46 +39,35 @@ def random_directions(param_vector):
     direction2 = torch.randn_like(param_vector)
     return direction1, direction2
 
-
 if __name__ == "__main__":
     parser = config.new_parser()
     config.add_dataset_argument(parser)
     config.add_model_argument(parser)
     config.add_training_argument(parser)
     config.add_eval_argument(parser)
-    
-    # For HiCOT_C
-    parser.add_argument('--weight_loss_coherence', type=float, default=1.0)
-    parser.add_argument('--cooc_norm', type=str, default='log', choices=['log', 'max', 'sqrt'])
-    parser.add_argument('--cooc_window_size', type=int, default=5)
-    
-    # For HiCOT_Plus
-    parser.add_argument('--weight_loss_DTC', type=float, default=1.0, help='Weight for Document-Topic Contrastive loss')
-
     args = parser.parse_args()
-
     current_time = miscellaneous.get_current_datetime()
     current_run_dir = os.path.join(RESULT_DIR, current_time)
     miscellaneous.create_folder_if_not_exist(current_run_dir)
-
     config.save_config(args, os.path.join(current_run_dir, 'config.txt'))
     seed.seedEverything(args.seed)
     print(args)
-
     if args.dataset in ['YahooAnswers', '20NG', 'AGNews', 'IMDB', 'SearchSnippets', 'GoogleNews']:
         read_labels = True
     else:
         read_labels = False
     print(f"read labels = {read_labels}")
 
-    ## Set contextual_embed = False
+    # Determine if contextual embeddings are needed upfront
+    contextual_needed = args.model in ["CombinedTM", "CombinedTM_Plus", "HiCOT", "HiCOT_Plus", "NeuroMax_Plus", "ETM_Plus", "FASTopic_Plus"]
+
     dataset = datasethandler.BasicDatasetHandler(
         os.path.join(DATA_DIR, args.dataset), device=args.device, read_labels=read_labels,
-        as_tensor=True, contextual_embed=False, args=args)
-
+        as_tensor=True, contextual_embed=contextual_needed, args=args)
+    
     pretrainWE = scipy.sparse.load_npz(os.path.join(
         DATA_DIR, args.dataset, "word_embeddings.npz")).toarray()
-    
+
     if args.model == "HiCOT":
         model = HiCOT(vocab_size=dataset.vocab_size,
                         data_name=args.dataset,
@@ -91,12 +87,11 @@ if __name__ == "__main__":
                         weight_loss_CLT = args.weight_loss_CLT,
                         threshold_epoch=args.threshold_epoch,
                         threshold_cluster=args.threshold_cluster,
-                        doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
+                        # doc_embeddings is no longer passed here
                         method_CL=args.method_CL,
                         metric_CL=args.metric_CL
                         ) 
         model = model.to(args.device)
-
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
 
@@ -125,61 +120,159 @@ if __name__ == "__main__":
             doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
             method_CL=args.method_CL,
             metric_CL=args.metric_CL,
-            # New parameter for HiCOT_Plus
             weight_loss_DTC=args.weight_loss_DTC
         )
         model = model.to(args.device)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
 
-    elif args.model == "HiCOT_C":
-        # Validate coherence parameters
-        print(f"HiCOT_C Coherence parameters:")
-        print(f"  weight_loss_coherence: {getattr(args, 'weight_loss_coherence', 1.0)}")
-        print(f"  cooc_norm: {getattr(args, 'cooc_norm', 'log')}")
-        
-        model = HiCOT_C(
+    elif args.model == "ETM_Plus":
+        print(f"ETM_Plus parameters:")
+        print(f"--weight_loss_DTC: {args.weight_loss_DTC}")
+        model = ETM_Plus(
             vocab_size=dataset.vocab_size,
-            data_name=args.dataset,
             num_topics=args.num_topics,
             dropout=args.dropout,
             pretrained_WE=pretrainWE if args.use_pretrainWE else None,
-            weight_loss_ECR=args.weight_ECR,
-            alpha_ECR=args.alpha_ECR,
-            weight_loss_TP=args.weight_loss_TP,
             weight_loss_DT=args.weight_loss_DT,
-            alpha_TP=args.alpha_TP,
-            alpha_DT=args.alpha_DT,
-            beta_temp=args.beta_temp,
-            vocab=dataset.vocab,
+            weight_loss_TP=args.weight_loss_TP,
             weight_loss_CLC=args.weight_loss_CLC,
-            max_clusters=args.max_clusters,
+            alpha_TP=args.alpha_TP,
             weight_loss_CLT=args.weight_loss_CLT,
+            weight_loss_DTC=args.weight_loss_DTC,
             threshold_epoch=args.threshold_epoch,
             threshold_cluster=args.threshold_cluster,
-            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
-            method_CL=args.method_CL,
             metric_CL=args.metric_CL,
-            # Thêm các tham số cho loss_coherence
-            weight_loss_coherence=getattr(args, 'weight_loss_coherence', 1.0),
-            cooc_norm=getattr(args, 'cooc_norm', 'log'),
-            cooc_window_size=getattr(args, 'cooc_window_size', 5),
-            train_data=dataset.train_bow,
+            max_clusters=args.max_clusters,
+            doc_embeddings=torch.tensor(dataset.train_doc_embeddings).float().to(args.device),
+            vocab=dataset.vocab,
+            device=args.device
         )
         model = model.to(args.device)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {trainable_params}")
-        
-        # Test coherence loss immediately after model creation
-        print("Testing HiCOT_C coherence loss computation...")
-        with torch.no_grad():
-            test_loss = model.get_loss_coherence()
-            print(f"Initial coherence loss: {test_loss}")
+
+    elif args.model == "FASTopic_Plus":
+        print(f"FASTopic_Plus parameters:")
+        # Use contextual embeddings if available, otherwise fallback to doc2vec
+        if hasattr(dataset, 'train_contextual_embed') and dataset.train_contextual_embed is not None:
+            doc_embeddings = torch.tensor(dataset.train_contextual_embed).float().to(args.device)
+            contextual_embed_size = dataset.train_contextual_embed.shape[1]
+        else:
+            doc_embeddings = torch.tensor(dataset.train_doc_embeddings).float().to(args.device)
+            contextual_embed_size = dataset.train_doc_embeddings.shape[1]
+
+        model = FASTopic_Plus(
+            vocab_size=dataset.vocab_size,
+            embed_size=dataset.embed_size if hasattr(dataset, 'embed_size') else args.embed_size if hasattr(args, 'embed_size') else 200,
+            num_topics=args.num_topics,
+            contextual_embed_size=contextual_embed_size,
+            weight_loss_CLT=args.weight_loss_CLT,
+            weight_loss_CLC=args.weight_loss_CLC,
+            weight_loss_DTC=args.weight_loss_DTC,
+            weight_loss_TP=args.weight_loss_TP,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            metric_CL=args.metric_CL,
+            max_clusters=args.max_clusters,
+            # doc_embeddings is no longer passed here
+            sinkhorn_alpha=getattr(args, 'sinkhorn_alpha', 20.0),
+            OT_max_iter=getattr(args, 'sinkhorn_max_iter', 500),
+            device=args.device
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
+    elif args.model == "NeuroMax_Plus":
+        print(f"NeuroMax_Plus parameters:")
+        model = NeuroMax_Plus(
+            vocab_size=dataset.vocab_size,
+            data_name=args.dataset,
+            embed_size=args.embed_size if hasattr(args, 'embed_size') else 200,
+            num_topics=args.num_topics,
+            num_groups=args.num_groups if hasattr(args, 'num_groups') else 10,
+            en_units=args.en_units if hasattr(args, 'en_units') else 200,
+            dropout=args.dropout,
+            pretrained_WE=pretrainWE if args.use_pretrainWE else None,
+            beta_temp=args.beta_temp,
+            weight_loss_ECR=args.weight_ECR,
+            weight_loss_GR=getattr(args, 'weight_loss_GR', 250.0),
+            alpha_GR=getattr(args, 'alpha_GR', 20.0),
+            alpha_ECR=args.alpha_ECR,
+            sinkhorn_alpha=getattr(args, 'sinkhorn_alpha', 20.0),
+            sinkhorn_max_iter=getattr(args, 'sinkhorn_max_iter', 500),
+            weight_loss_InfoNCE=getattr(args, 'weight_loss_InfoNCE', 10.0),
+            weight_loss_CLT=args.weight_loss_CLT,
+            weight_loss_CLC=args.weight_loss_CLC,
+            alpha_TP=args.alpha_TP,
+            weight_loss_DTC=args.weight_loss_DTC,
+            weight_loss_TP=args.weight_loss_TP,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            metric_CL=args.metric_CL,
+            max_clusters=args.max_clusters,
+            vocab=dataset.vocab,
+            device=args.device,
+            contextual_embed_size=dataset.contextual_embed_size
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+    
+
+    elif args.model == 'ETM':
+        model = ETM(vocab_size=dataset.vocab_size,
+                    num_topics=args.num_topics,
+                    dropout=args.dropout,
+                    pretrained_WE=pretrainWE if args.use_pretrainWE else None,
+                    device=args.device
+                    )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
+    elif args.model == "CombinedTM_Plus":
+        print(f"CombinedTM_Plus parameters:")
+        # dataset is already loaded with contextual_embed=True
+        model = CombinedTM_Plus(
+            vocab_size=dataset.vocab_size,
+            contextual_embed_size=dataset.contextual_embed_size,
+            num_topics=args.num_topics,
+            en_units=200,  # Fixed value
+            dropout=args.dropout,
+            vocab=dataset.vocab,
+            weight_loss_CLT=args.weight_loss_CLT,
+            weight_loss_CLC=args.weight_loss_CLC,
+            weight_loss_DTC=args.weight_loss_DTC,
+            weight_loss_TP=args.weight_loss_TP,
+            alpha_TP=args.alpha_TP,
+            threshold_epoch=args.threshold_epoch,
+            threshold_cluster=args.threshold_cluster,
+            metric_CL=args.metric_CL,
+            max_clusters=args.max_clusters,
+            # doc_embeddings is no longer passed here
+            sinkhorn_max_iter=500  # Fixed value
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
+
+    elif args.model == 'CombinedTM':
+        # dataset is already loaded with contextual_embed=True
+        model = CombinedTM(
+            vocab_size=dataset.vocab_size,
+            contextual_embed_size=dataset.contextual_embed_size,
+            num_topics=args.num_topics,
+            en_units=200,  # Fixed value
+            dropout=args.dropout
+        )
+        model = model.to(args.device)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters: {trainable_params}")
 
     else:
-        print(f"Wrong model")
-
-    # Create a trainer
+        raise ValueError(f"Unknown model: {args.model}")
     trainer = basic_trainer.BasicTrainer(model, model_name=args.model,
                                             epochs=args.epochs,
                                             learning_rate=args.lr,
@@ -189,16 +282,12 @@ if __name__ == "__main__":
                                             device=args.device
                                             )
 
-
-    # Train the model
+    # The training call is now unified
     trainer.train(dataset)
-
-    # Save embeddings
     trainer.save_embeddings(current_run_dir)
-
-    # Save beta, theta and top words
     beta = trainer.save_beta(current_run_dir)
     train_theta, test_theta = trainer.save_theta(dataset, current_run_dir)
+
     top_words_10 = trainer.save_top_words(
         dataset.vocab, 10, current_run_dir)
     top_words_15 = trainer.save_top_words(
@@ -208,28 +297,43 @@ if __name__ == "__main__":
     top_words_25 = trainer.save_top_words(
         dataset.vocab, 25, current_run_dir)
 
-    # Argmax of train and test theta
     train_theta_argmax = train_theta.argmax(axis=1)
-    test_theta_argmax = test_theta.argmax(axis=1)        
+    test_theta_argmax = test_theta.argmax(axis=1)    
 
     TD_15 = evaluations.compute_topic_diversity(
         top_words_15, _type="TD")
     print(f"TD_15: {TD_15:.5f}")
 
-
-    # Evaluating clustering
     if read_labels:
+        # Use the appropriate dataset labels for clustering evaluation
         clustering_results = evaluations.evaluate_clustering(
             test_theta, dataset.test_labels)
         print(f"NMI: ", clustering_results['NMI'])
         print(f'Purity: ', clustering_results['Purity'])
-    
-    
+
     TC_15_list, TC_15 = evaluations.topic_coherence.TC_on_wikipedia(
         os.path.join(current_run_dir, 'top_words_15.txt'))
     print(f"TC_15: {TC_15:.5f}")
 
-    filename = f"results_{args.dataset}_topics{args.num_topics}_epochs{args.epochs}_model{args.model}.txt"
+    # if read_labels:
+    #     classification_results = evaluations.evaluate_classification(
+    #         train_theta, test_theta, dataset.train_labels, dataset.test_labels, tune=args.tune_SVM)
+    #     print(f"Accuracy: ", classification_results['acc'])
+    #     print(f"Macro-f1", classification_results['macro-F1'])
+
+
+    filename = (
+        f"results_"
+        f"dataset{args.dataset}_model{args.model}_topics{args.num_topics}_epochs{args.epochs}"
+        f"_lr{args.lr}_batch{args.batch_size}_seed{args.seed}"
+        f"_ECR{args.weight_ECR}_aECR{args.alpha_ECR}"
+        f"_TP{args.weight_loss_TP}_DT{args.weight_loss_DT}_aTP{args.alpha_TP}_aDT{args.alpha_DT}"
+        f"_dropout{args.dropout}_beta{args.beta_temp}"
+        f"_DTC{getattr(args, 'weight_loss_DTC', 'NA')}_CLT{getattr(args, 'weight_loss_CLT', 'NA')}_CLC{getattr(args, 'weight_loss_CLC', 'NA')}"
+        f"_maxclu{getattr(args, 'max_clusters', 'NA')}_threpoch{getattr(args, 'threshold_epoch', 'NA')}_thrclu{getattr(args, 'threshold_cluster', 'NA')}"
+        f"_metric{getattr(args, 'metric_CL', 'NA')}"
+        f".txt"
+    )
     filename = filename.replace(' ', '_')
     filepath = os.path.join(current_run_dir, filename)
     with open(filepath, 'w') as f:
@@ -241,7 +345,8 @@ if __name__ == "__main__":
             f.write("Purity: N/A\n")
         f.write(f"TD_15: {TD_15:.5f}\n")
         f.write(f"TC_15: {TC_15:.5f}\n")
-
+        # f.write(f"Accuracy: {classification_results['acc']:.5f}\n")
+        # f.write(f"Macro-f1: {classification_results['macro-F1']:.5f}\n")
     print(f"Done in {filepath}")
 
 

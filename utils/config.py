@@ -28,6 +28,7 @@ def add_model_argument(parser):
     parser.add_argument('--threshold_epoch', type=int, default=10)  
     parser.add_argument('--threshold_cluster', type=int, default=10)  
     parser.add_argument('--weight_loss_CLT', type=float, default=1.0)
+    parser.add_argument('--weight_loss_DTC', type=float, default=1.0)
     parser.add_argument('--method_CL', type=str, default='HAC')
     parser.add_argument('--metric_CL', type=str, default='euclidean')
     parser.add_argument('--beta_temp', type=float, default=0.2)
