@@ -312,7 +312,7 @@ class HiCOT(nn.Module):
     def forward(self, indices, input, epoch_id=None, doc_embeddings=None):
 
         bow = input[0]
-        doc_embeddings = doc_embeddings.to(self.topic_embeddings.device)
+        iCto(self.topic_embeddings.device)
 
         rep, mu, logvar = self.get_representation(bow)
         loss_KL = self.compute_loss_KL(mu, logvar)

@@ -14,12 +14,10 @@ class ETM(nn.Module):
         Adji B. Dieng, Francisco J. R. Ruiz, David M. Blei.
     '''
     def __init__(self, vocab_size, embed_size=200, num_topics=50, num_groups=10, en_units=800, dropout=0., 
-                    cluster_distribution=None, cluster_mean=None, cluster_label=None, weight_OT=1, is_OT=False,
-                    pretrained_WE=None, sinkhorn_alpha = 20.0, sinkhorn_max_iter=1000, train_WE=False, theta_train=False,
+                    pretrained_WE=None, train_WE=False, theta_train=False,
                     device='cuda'):
         super().__init__()
         self.device = device
-        self.is_OT = is_OT
         if pretrained_WE is not None:
             self.word_embeddings = nn.Parameter(torch.from_numpy(pretrained_WE).float())
         else:
@@ -27,10 +25,10 @@ class ETM(nn.Module):
 
         self.word_embeddings.requires_grad = train_WE
 
-        #self.topic_embeddings = nn.Parameter(torch.randn((num_topics, self.word_embeddings.shape[1])))
         self.topic_embeddings = torch.empty((num_topics, self.word_embeddings.shape[1]))
         nn.init.trunc_normal_(self.topic_embeddings, std=0.1)
         self.topic_embeddings = nn.Parameter(F.normalize(self.topic_embeddings))
+
         self.theta_train = theta_train
         self.encoder1 = nn.Sequential(
             nn.Linear(vocab_size, en_units),
@@ -41,33 +39,13 @@ class ETM(nn.Module):
         )
 
         # # Thêm 
-        self.weight_OT = weight_OT
         self.num_topics = num_topics
         self.num_groups = num_groups
-        # self.is_OT = is_OT
 
         self.mean_bn = nn.BatchNorm1d(num_topics)
         self.mean_bn.weight.requires_grad = False
         self.logvar_bn = nn.BatchNorm1d(num_topics)
         self.logvar_bn.weight.requires_grad = False
-
-        # Add OT
-        self.cluster_mean = nn.Parameter(torch.from_numpy(cluster_mean).float(), requires_grad=False)
-        self.cluster_distribution = nn.Parameter(torch.from_numpy(cluster_distribution).float(), requires_grad=False)
-        self.cluster_label = cluster_label
-        if not isinstance(self.cluster_label, torch.Tensor):
-            self.cluster_label = torch.tensor(self.cluster_label, dtype=torch.long, device='cuda')
-        else:
-            self.cluster_label = self.cluster_label.to(device='cuda', dtype=torch.long)
-        
-        self.map_t2c = nn.Linear(self.word_embeddings.shape[1], self.cluster_mean.shape[1], bias=False)
-        self.OT = OT(weight_OT, sinkhorn_alpha, sinkhorn_max_iter)
-
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
-        # #
-
 
         self.fc21 = nn.Linear(en_units, num_topics)
         self.fc22 = nn.Linear(en_units, num_topics)
@@ -110,24 +88,15 @@ class ETM(nn.Module):
         beta = F.softmax(torch.matmul(self.topic_embeddings.to(self.device), self.word_embeddings.T.to(self.device)), dim=1)
         return beta
 
-    def forward(self, indices, input, avg_loss=True, epoch_id = None):
+    def forward(self, indices, input, avg_loss=True, epoch_id=None):
         bow = input[0].to(self.device)
         theta, mu, logvar = self.get_theta(bow)
-        beta = self.get_beta().to(self.device)
-        recon_input = torch.matmul(theta, beta).to(self.device)
-
-        loss_OT = 0
-        if self.is_OT:
-             loss_OT = self.get_loss_OT(input, indices)
-        else:
-             loss_OT = 0.0
-
+        beta = self.get_beta()
+        recon_input = torch.matmul(theta, beta)
         loss = self.loss_function(bow, recon_input, mu, logvar, avg_loss)
-        loss += loss_OT
 
         rst_dict = {
             'loss': loss,
-            'loss_OT': loss_OT
         }
         return rst_dict
 
@@ -138,11 +107,3 @@ class ETM(nn.Module):
         if avg_loss:
             loss = loss.mean()
         return loss
-        
-    def get_loss_OT(self, input, indices):
-        bow = input[0]
-        theta, mu, logvar = self.get_theta(bow)
-        cd_batch = self.cluster_distribution[indices]  
-        cost = self.pairwise_euclidean_distance(self.cluster_mean, self.map_t2c(self.topic_embeddings))  
-        loss_OT = self.weight_OT * self.OT(theta, cd_batch, cost)  
-        return loss_OT
